@@ -105,9 +105,10 @@ jobs:
             cross: true
             nightly: false
 
-          # mips 是 Tier 3：rustup 不发布预编译 std，必须 nightly + build-std，
-          # 交叉 C 工具链由 cross 镜像提供。
-          - target: mips-unknown-linux-gnu
+          # mips 只构建 64 位版本：32 位 mips-unknown-linux-gnu 在依赖层就过不去
+          # —— rmcp / tokio 需要 std::sync::atomic::AtomicU64，而 MIPS32 没有 64 位原子操作。
+          # mips64 是 Tier 3（rustup 不发布 std），因此用 nightly + build-std。
+          - target: mips64-unknown-linux-gnuabi64
             os: ubuntu-latest
             archive: tar.gz
             exe: ""
