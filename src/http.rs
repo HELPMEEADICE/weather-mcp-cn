@@ -31,6 +31,14 @@ pub struct HttpClient {
 impl HttpClient {
     /// 依据配置构建客户端。
     pub fn new(config: &Config) -> Result<Self> {
+        if looks_like_blocked_agent(&config.user_agent) {
+            warn!(
+                user_agent = %config.user_agent,
+                "这个 User-Agent 会被中国天气网 CDN 拦截（实测 curl/wget/python-requests/go-http-client/java/scrapy/okhttp 均返回 403），\
+                 实况与预警接口将不可用；建议用 WEATHER_MCP_USER_AGENT 换成默认值或浏览器 UA"
+            );
+        }
+
         let client = reqwest::Client::builder()
             .user_agent(config.user_agent.clone())
             .connect_timeout(config.connect_timeout)
@@ -93,6 +101,14 @@ impl HttpClient {
             };
 
             let status = response.status();
+            let code = status.as_u16();
+            // CDN 会在响应头里打上 Forbid 标识，先取下来再消费响应体。
+            let forbid_header = response
+                .headers()
+                .get("x-ccdn-forbid-code")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+
             if status.is_success() {
                 let content_type = response
                     .headers()
@@ -115,12 +131,10 @@ impl HttpClient {
                 return Ok(decode_body(&bytes, content_type.as_deref()));
             }
 
-            let code = status.as_u16();
-            let error = WeatherError::UpstreamStatus {
-                status: code,
-                url: url.to_string(),
-            };
-            warn!(url, status = code, attempt, "上游返回非 2xx");
+            // 非 2xx：读一下响应体，用来区分「CDN 拦截」与「普通错误状态」。
+            let body = response.text().await.unwrap_or_default();
+            let error = classify_http_error(code, forbid_header.as_deref(), &body, url);
+            warn!(url, status = code, attempt, error = %error, "上游返回非 2xx");
             let retryable = error.is_retryable();
             last_error = Some(error);
             if retryable && attempt + 1 < attempts {
@@ -157,6 +171,98 @@ fn host_of(url: &str) -> String {
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     // 去掉端口，同一站点不同端口共享限速槽位。
     host.split(':').next().unwrap_or(host).to_string()
+}
+
+/// 把非 2xx 响应分类成具体错误。
+///
+/// 中国天气网的 CDN 在拦截请求时会回 403，并在响应头 `X-CCDN-FORBID-CODE`
+/// 与响应体里带上 `Forbid_code`。这类拦截和「接口真的不存在」表现完全不同，
+/// 需要给出可排查的提示，而不是一句干巴巴的 403。
+pub fn classify_http_error(
+    status: u16,
+    forbid_header: Option<&str>,
+    body: &str,
+    url: &str,
+) -> WeatherError {
+    let forbid = forbid_header
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| extract_forbid_code(body));
+
+    match forbid {
+        Some(code) if matches!(status, 403 | 406 | 412) => WeatherError::Blocked {
+            status,
+            hint: forbid_hint(&code).to_string(),
+            code,
+            url: url.to_string(),
+        },
+        _ => WeatherError::UpstreamStatus {
+            status,
+            url: url.to_string(),
+        },
+    }
+}
+
+/// 把实测得到的 `Forbid_code` 翻译成可执行的排查建议。
+///
+/// 映射来自对 `d1.weather.com.cn` 的直接实测：
+/// `020200` 只在 Referer 不合规时出现，`020300` 只在 User-Agent 不合规时出现。
+fn forbid_hint(code: &str) -> &'static str {
+    match code {
+        "020200" => {
+            "该错误码实测对应 Referer 不合规：缺失，或不是 https://www.weather.com.cn/ 域下的地址。\
+             本项目所有请求都带正确 Referer，出现此错误通常是中间代理改写了请求头"
+        }
+        "020300" => {
+            "该错误码实测对应 User-Agent 不合规：命中爬虫黑名单\
+             （curl/、Wget/、python-requests、Go-http-client、Java/、Scrapy/、okhttp/）或为空。\
+             请检查 WEATHER_MCP_USER_AGENT；默认值可用"
+        }
+        _ => {
+            "请求头不符合站点要求。请检查 WEATHER_MCP_USER_AGENT，\
+             并确认请求没有经过会改写请求头的代理"
+        }
+    }
+}
+
+/// 从 CDN 的 403 页面里抠出 `Forbid_code`。
+fn extract_forbid_code(body: &str) -> Option<String> {
+    let marker = "Forbid_code:";
+    let start = body.find(marker)? + marker.len();
+    let rest = body[start..].trim_start();
+    let code: String = rest
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric())
+        .collect();
+    if code.is_empty() { None } else { Some(code) }
+}
+
+/// 判断一个 User-Agent 是否会被中国天气网 CDN 拦截。
+///
+/// 实测（2026-11-05）：`curl/`、`Wget/`、`python-requests/`、`Go-http-client`、
+/// `Java/`、`Scrapy/`、`okhttp/` 一律 403，而自定义 UA 与浏览器 UA 正常。
+pub fn looks_like_blocked_agent(user_agent: &str) -> bool {
+    const BLOCKED: &[&str] = &[
+        "curl/",
+        "wget/",
+        "python-requests",
+        "python-urllib",
+        "go-http-client",
+        "java/",
+        "scrapy/",
+        "okhttp/",
+        "httpclient",
+        "libwww",
+        "phantomjs",
+        "headlesschrome",
+    ];
+    let lower = user_agent.trim().to_ascii_lowercase();
+    if lower.is_empty() {
+        return true;
+    }
+    BLOCKED
+        .iter()
+        .any(|marker| lower.starts_with(marker) || lower.contains(marker))
 }
 
 fn backoff_delay(attempt: u32) -> Duration {
@@ -234,5 +340,88 @@ mod tests {
     fn decodes_gbk_without_declaration() {
         let (encoded, _, _) = encoding_rs::GB18030.encode("多云转晴");
         assert_eq!(decode_body(&encoded, None), "多云转晴");
+    }
+
+    /// 实测抓到的 CDN 403 页面（缺 Referer 时）。
+    const FORBID_BODY: &str = "<html><body><center><h1>403 Forbidden</h1></center>\
+<p>Node_info: 3034-CACHE8</p><p>Client_ip: 1.2.3.4</p><p>Forbid_code: 020200</p>\
+<p>Hit-status: MISS</p></body></html>";
+
+    #[test]
+    fn extracts_forbid_code_from_cdn_page() {
+        assert_eq!(extract_forbid_code(FORBID_BODY).as_deref(), Some("020200"));
+        assert_eq!(extract_forbid_code("<html>403</html>"), None);
+        assert_eq!(extract_forbid_code("Forbid_code:"), None);
+    }
+
+    #[test]
+    fn classifies_cdn_403_as_blocked() {
+        let error = classify_http_error(
+            403,
+            Some("020200"),
+            FORBID_BODY,
+            "http://d1.weather.com.cn/sk_2d/101010100.html",
+        );
+        assert_eq!(error.code(), "upstream_blocked");
+        assert!(error.is_retryable(), "CDN 拦截可能是短时风控，应允许重试");
+        let text = error.to_string();
+        assert!(text.contains("020200"), "错误里要带 Forbid_code：{text}");
+        assert!(text.contains("Referer"), "错误里要给出排查方向：{text}");
+    }
+
+    /// 实测映射：020200 只出现在 Referer 不合规时，020300 只出现在 UA 不合规时。
+    #[test]
+    fn forbid_codes_map_to_their_cause() {
+        let referer = classify_http_error(403, Some("020200"), "", "u").to_string();
+        assert!(referer.contains("Referer"), "{referer}");
+
+        let agent = classify_http_error(403, Some("020300"), "", "u").to_string();
+        assert!(agent.contains("User-Agent"), "{agent}");
+        assert!(agent.contains("WEATHER_MCP_USER_AGENT"), "{agent}");
+
+        let unknown = classify_http_error(403, Some("999999"), "", "u").to_string();
+        assert!(unknown.contains("WEATHER_MCP_USER_AGENT"), "{unknown}");
+    }
+
+    #[test]
+    fn classifies_403_without_marker_as_plain_status() {
+        let error = classify_http_error(403, None, "<html>nope</html>", "https://x/y");
+        assert_eq!(error.code(), "upstream_status");
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn classifies_forbid_code_from_body_only() {
+        let error = classify_http_error(403, None, FORBID_BODY, "https://x/y");
+        assert_eq!(error.code(), "upstream_blocked");
+    }
+
+    #[test]
+    fn keeps_5xx_retryable() {
+        let error = classify_http_error(503, None, "", "https://x/y");
+        assert_eq!(error.code(), "upstream_status");
+        assert!(error.is_retryable());
+    }
+
+    #[test]
+    fn recognizes_agents_the_cdn_blocks() {
+        for ua in [
+            "curl/8.7.1",
+            "Wget/1.21",
+            "python-requests/2.31",
+            "Go-http-client/1.1",
+            "Java/17",
+            "Scrapy/2.11",
+            "okhttp/4.9",
+            "",
+        ] {
+            assert!(looks_like_blocked_agent(ua), "{ua} 应被判为会被拦截");
+        }
+        for ua in [
+            "weather-mcp-cn/0.1.0 (+https://github.com/HELPMEEADICE/weather-mcp-cn)",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        ] {
+            assert!(!looks_like_blocked_agent(ua), "{ua} 应放行");
+        }
     }
 }

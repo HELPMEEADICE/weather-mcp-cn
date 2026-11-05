@@ -46,6 +46,19 @@ pub enum WeatherError {
     #[error("中国天气网返回 HTTP {status}（{url}）")]
     UpstreamStatus { status: u16, url: String },
 
+    /// 被上游 CDN / WAF 拦截。
+    ///
+    /// 与中国天气网实测确认的两个触发条件：`Referer` 缺失或不是
+    /// `www.weather.com.cn`（`Forbid_code=020200`），以及 `User-Agent` 命中爬虫黑名单
+    /// （`Forbid_code=020300`）。
+    #[error("请求被中国天气网 CDN 拦截（HTTP {status}，Forbid_code={code}）：{url}。{hint}")]
+    Blocked {
+        status: u16,
+        code: String,
+        hint: String,
+        url: String,
+    },
+
     /// 请求超时。
     #[error("请求超时：{0}")]
     Timeout(String),
@@ -69,6 +82,7 @@ impl WeatherError {
             Self::Unsupported(_) => "unsupported_data",
             Self::Upstream(_) => "upstream_unavailable",
             Self::UpstreamStatus { .. } => "upstream_status",
+            Self::Blocked { .. } => "upstream_blocked",
             Self::Timeout(_) => "timeout",
             Self::Parse(_) => "parse_error",
             Self::Config(_) => "config_error",
@@ -90,6 +104,9 @@ impl WeatherError {
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Timeout(_) | Self::Upstream(_) => true,
+            // CDN 拦截既可能是请求头永久不合规，也可能是短时风控，
+            // 重试一两次成本很低，能救回后者。
+            Self::Blocked { .. } => true,
             Self::UpstreamStatus { status, .. } => *status == 429 || *status >= 500,
             _ => false,
         }

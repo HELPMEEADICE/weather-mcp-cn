@@ -110,7 +110,7 @@ MCP client ──stdio JSON-RPC──▶ WeatherServer (server.rs)
 
 实测结论（2026-11，`curl` 直接请求核对）：
 
-1. `d1.weather.com.cn` 会校验 `Referer`，缺失时返回 **403**，因此所有数据接口请求都带 `Referer: https://www.weather.com.cn/`。
+1. `d1.weather.com.cn` 的 CDN 会校验请求头，不合规时返回 **403** 并带 `X-CCDN-FORBID-CODE`：`020200` = `Referer` 缺失或不是 `https://www.weather.com.cn/` 域下的地址；`020300` = `User-Agent` 命中爬虫黑名单（`curl/`、`Wget/`、`python-requests`、`Go-http-client`、`Java/`、`Scrapy/`、`okhttp/`）或为空。因此本项目所有数据接口请求都带正确 Referer，默认 UA 也是实测可用的自定义值。
 2. `https://www.weather.com.cn/robots.txt` 内容为 `User-agent: *` / `Allow: /`，允许抓取。
 3. 站点**没有**公开逐 1 小时预报接口：`hourly_2d`、`hour3data` 等路径都 302 到 404 页。公开数据只有 3 小时粒度。
 4. 站点不提供体感温度、降水概率，本项目如实返回 `None` 而不是推算。
@@ -228,7 +228,7 @@ WEATHER_MCP_CITIES_FILE=/etc/weather-mcp-cn/cities.json weather-mcp-cn --transpo
 | `fmt` | `cargo fmt --all -- --check` |
 | `clippy` | `cargo clippy --all-targets --locked -- -D warnings`，两套 TLS 后端各跑一遍 |
 | `test` | `ubuntu` / `windows` / `macos` 三平台 × 两套 TLS 后端（`cargo test --locked` + `--no-default-features --features tls-native`） |
-| `live` | 仅手动触发，真访问中国天气网跑 10 个联网用例 |
+| `live` | 仅手动触发，真访问中国天气网跑 14 个联网用例 |
 
 触发：`push` 到 `main`、`pull_request`、手动。
 
@@ -579,7 +579,8 @@ weather-mcp-cn [选项]
 | `ambiguous_city` | -32602 | 名称命中多个行政区（`data.candidates` 给出候选） | 用更完整的名称，如 `深圳市南山区` |
 | `invalid_city_code` | -32602 | 代码格式不合法 | 应为 101 开头的 9 位数字 |
 | `unsupported_data` | -32602 | 数据源明确不提供该数据 | 换查询口径 |
-| `upstream_status` | -32603 | 上游返回 403 / 404 / 429 / 5xx | 检查城市代码；稍后重试 |
+| `upstream_status` | -32603 | 上游返回 429 / 5xx 或普通 404 | 检查城市代码；稍后重试 |
+| `upstream_blocked` | -32603 | 被中国天气网 CDN 拦截（`Forbid_code=020200` 表示 Referer 不合规，`020300` 表示 User-Agent 不合规） | 见[常见问题](#常见问题)里的 403 排查 |
 | `upstream_unavailable` | -32603 | 连接失败 / 数据源结构异常 | 稍后重试 |
 | `timeout` | -32603 | 请求超时 | 稍后重试或调大 `WEATHER_MCP_REQUEST_TIMEOUT_SECS` |
 | `parse_error` | -32603 | 页面结构变化导致解析失败 | 提 issue，附 `source.url` |
@@ -608,9 +609,9 @@ cargo test
 | `tests/parser_tests.rs` | 11 | 用**真实抓取样本**离线验证四个解析器 |
 | `tests/city_tests.rs` | 12 | 用内置 3221 条城市库验证名称/代码/层级/歧义解析 |
 | `tests/mcp_tests.rs` | 5 | **真正启动二进制**，走 stdio 协议 `initialize` → `tools/list` → `tools/call` |
-| `tests/live_tests.rs` | 10 | 联网集成测试，默认 `#[ignore]` |
+| `tests/live_tests.rs` | 14 | 联网集成测试（含 403/CDN 拦截回归），默认 `#[ignore]` |
 
-`cargo test` 汇总：**53 passed, 0 failed, 10 ignored**。
+`cargo test` 汇总：**60 passed, 0 failed, 14 ignored**。
 
 `tests/fixtures/` 里保存了 2026-11-05 抓取的真实响应样本（实况 / 7 日预报 / 逐 3 小时 / 预警），因此这些解析测试既离线又真实。
 
@@ -635,6 +636,18 @@ pwsh -File scripts/mcp-e2e.ps1 -Binary target\release\weather-mcp-cn.exe
 ---
 
 ## 常见问题
+
+**Q：报 `upstream_blocked` / HTTP 403 怎么办？**
+中国天气网前面挂着 CDN，它对请求头有硬性要求。实测（2026-11-05 直接抓取核对）只有两个触发条件：
+
+| `Forbid_code` | 触发条件 | 处理 |
+| --- | --- | --- |
+| `020200` | `Referer` 缺失，或来源不是 `https://www.weather.com.cn/` 域下的地址 | 本项目**所有**请求都带正确 Referer；出现这个码几乎只有一种可能：中间代理改写了请求头，请直连或换代理 |
+| `020300` | `User-Agent` 命中爬虫黑名单（`curl/`、`Wget/`、`python-requests`、`Go-http-client`、`Java/`、`Scrapy/`、`okhttp/`）或为空 | 检查 `WEATHER_MCP_USER_AGENT`；默认值 `weather-mcp-cn/<版本> (+仓库地址)` 可用，浏览器 UA 也可用 |
+
+不会触发 403 的情况也实测过：同一主机 4 路并发连续 100 次请求（无间隔）全部 200，不存在速率型 403；`www.weather.com.cn` 与 `j.i8tq.com` 不校验 Referer。
+
+拦截是**可重试**的（可能是短时风控），客户端会按退避重试后仍失败才报错，错误体里带 `Forbid_code` 和对应排查建议。
 
 **Q：为什么 `get_hourly_weather` 返回的是 3 小时间隔？**
 中国天气网公开数据只有 3 小时粒度（`hour3data`）。逐 1 小时接口不存在，本项目坚持「不推算」，因此如实标注 `resolution_hours: 3`。
@@ -670,6 +683,7 @@ pwsh -File scripts/mcp-e2e.ps1 -Binary target\release\weather-mcp-cn.exe
 4. **区县显示名后缀**：中国天气网只给简称（如「和林」「托县」），`display_name` 会按常见后缀补全，个别会与实际行政区名略有出入；`province` / `city` / `district` / `code` 均为原始数据，未加工。
 5. **Streamable HTTP 模式**：`--transport http` 已预留但尚未实现，当前只提供 stdio。
 6. **站点改版的脆弱性**：预报/逐 3 小时依赖 HTML 结构，上游改版会导致 `parse_error`（明确报错，不会返回假数据）。数据接口（`dataSK` / `alarmDZ` / `hour3data`）是 JSON，稳定得多。
+7. **请求头由 CDN 把关**：改了 `WEATHER_MCP_USER_AGENT` 或走了会改写请求头的代理，可能触发 403（`upstream_blocked`）。默认配置实测不受影响。
 7. **时区**：所有时间统一按北京时间（UTC+8）输出，与服务器所在时区无关。
 
 ---
