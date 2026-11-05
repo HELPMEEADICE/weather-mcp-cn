@@ -1,0 +1,239 @@
+name: Build
+
+on:
+  # 发布 Release 时自动构建并把产物传到该 Release
+  release:
+    types: [published]
+  # 手动触发：产物作为 Actions artifact 下载；填了 tag 则同时上传到该 Release
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "（可选）把产物上传到这个已存在的 Release tag，例如 v0.1.0；留空则只产出 Actions artifact"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # 单个目标失败不影响其它目标继续产出
+      fail-fast: false
+      matrix:
+        include:
+          # ---------------- Windows ----------------
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe: ".exe"
+            features: "" # 默认 tls-rustls
+            cross: false
+            nightly: false
+
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            archive: zip
+            exe: ".exe"
+            # Windows 上 tls-native = SChannel，纯 API 绑定，不需要为 ARM64 交叉编译 C 代码
+            features: "tls-native"
+            cross: false
+            nightly: false
+
+          # ---------------- macOS ----------------
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            exe: ""
+            features: ""
+            cross: false
+            nightly: false
+
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+            exe: ""
+            features: ""
+            cross: false
+            nightly: false
+
+          # ---------------- Linux ----------------
+          # 全部走 cross：镜像里自带目标架构的 C 工具链与 OpenSSL，
+          # 因此统一使用 tls-native（系统 OpenSSL）。
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: ""
+            features: "tls-native"
+            cross: true
+            nightly: false
+
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: ""
+            features: "tls-native"
+            cross: true
+            nightly: false
+
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: ""
+            features: "tls-native"
+            cross: true
+            nightly: false
+
+          - target: riscv64gc-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: ""
+            features: "tls-native"
+            cross: true
+            nightly: false
+
+          # mips 只有 Tier 3 std（rustup 不发布），必须 nightly + build-std，
+          # 由 cross 镜像提供 mips 交叉 C 工具链与 OpenSSL。
+          - target: mips-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            exe: ""
+            features: "tls-native"
+            cross: true
+            nightly: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---------------- 版本号（用于产物命名） ----------------
+      - name: Resolve version
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REL_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "release" ]; then
+            v="$REL_TAG"
+          elif [ -n "$INPUT_TAG" ]; then
+            v="$INPUT_TAG"
+          else
+            v="0.0.0-dev.${SHA:0:7}"
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+          echo "产物版本：$v"
+
+      # ---------------- 工具链 ----------------
+      - name: Install Rust (stable)
+        if: ${{ !matrix.nightly }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Rust (nightly + rust-src，Tier-3 目标需要)
+        if: ${{ matrix.nightly }}
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Setup MSVC ARM64 cross toolchain
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      - name: Install cross
+        if: ${{ matrix.cross }}
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.target }}-${{ matrix.features || 'default' }}
+
+      # ---------------- 构建 ----------------
+      - name: Resolve feature flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.features }}" ]; then
+            echo "FEATURE_ARGS=--no-default-features --features ${{ matrix.features }}" >> "$GITHUB_ENV"
+          else
+            echo "FEATURE_ARGS=" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build (cross)
+        if: ${{ matrix.cross && !matrix.nightly }}
+        run: cross build --release --locked --target ${{ matrix.target }} $FEATURE_ARGS
+
+      - name: Build (cross + build-std，Tier-3 目标)
+        if: ${{ matrix.cross && matrix.nightly }}
+        run: cross build --release --locked --target ${{ matrix.target }} $FEATURE_ARGS -Z build-std=std,panic_abort
+
+      - name: Build (native)
+        if: ${{ !matrix.cross }}
+        run: cargo build --release --locked --target ${{ matrix.target }} $FEATURE_ARGS
+
+      # ---------------- 打包 ----------------
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $name = "weather-mcp-cn-$env:VERSION-${{ matrix.target }}"
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/weather-mcp-cn${{ matrix.exe }}" $stage
+          Copy-Item README.md, LICENSE $stage
+          Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
+          Get-ChildItem dist | Format-Table Name, Length
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="weather-mcp-cn-${VERSION}-${{ matrix.target }}"
+          stage="dist/${name}"
+          mkdir -p "$stage"
+          cp "target/${{ matrix.target }}/release/weather-mcp-cn" "$stage/"
+          cp README.md LICENSE "$stage/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ls -l dist
+
+      # ---------------- 产物 ----------------
+      # 手动触发时从这里下载
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: weather-mcp-cn-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      # Release 触发（或手动填写 tag）时自动上传到 Release
+      - name: Upload to GitHub Release
+        if: github.event_name == 'release' || inputs.tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "上传到 Release: $TAG"
+          gh release upload "$TAG" dist/* --clobber

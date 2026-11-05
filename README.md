@@ -1,5 +1,9 @@
 # weather-mcp-cn
 
+[![CI](https://github.com/HELPMEEADICE/weather-mcp-cn/actions/workflows/ci.yml/badge.svg)](https://github.com/HELPMEEADICE/weather-mcp-cn/actions/workflows/ci.yml)
+[![Build](https://github.com/HELPMEEADICE/weather-mcp-cn/actions/workflows/build.yml/badge.svg)](https://github.com/HELPMEEADICE/weather-mcp-cn/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **纯 Rust 实现的 Model Context Protocol（MCP）中国天气查询服务器。**
 
 数据全部来自[中国天气网](https://www.weather.com.cn/)的公开页面与公开数据接口——不需要 API Key、不需要注册账号、不依赖 Python / Node.js / 浏览器运行时。编译产物是**单个原生可执行文件**，可以被 Codex、Claude Desktop 或任何兼容 MCP 的客户端直接拉起。
@@ -19,6 +23,7 @@ weather-mcp-cn → https://d1.weather.com.cn/sk_2d/101280604.html
 - [技术架构](#技术架构)
 - [数据来源与使用限制](#数据来源与使用限制)
 - [编译方式](#编译方式)
+- [CI 与发布](#ci-与发布)
 - [安装与 Codex 集成](#安装与-codex-集成)
 - [MCP 工具说明](#mcp-工具说明)
 - [查询结果示例](#查询结果示例)
@@ -69,7 +74,7 @@ tests/               解析器 / 城市解析 / MCP 协议 / 联网集成测试
 scripts/mcp-e2e.ps1  真正启动二进制并走完 stdio 协议的端到端验证脚本
 ```
 
-技术栈：Rust Stable（Edition 2024）· `rmcp` 3.8（官方 Rust MCP SDK）· `tokio` · `reqwest`（rustls TLS）· `scraper` · `serde` / `schemars` · `regex` · `chrono` · `tracing` · `thiserror` · `encoding_rs`。
+技术栈：Rust Stable（Edition 2024）· `rmcp` 3.8（官方 Rust MCP SDK）· `tokio` · `reqwest`（TLS 后端可选 rustls / native）· `scraper` · `serde` / `schemars` · `regex` · `chrono` · `tracing` · `thiserror` · `encoding_rs`。
 
 刻意**没有**引入：Chromium / Playwright / Selenium、`clap`、`moka`、任何需要系统库的 TLS 实现。
 
@@ -141,16 +146,42 @@ cargo build --release
 
 ```toml
 [profile.release]
-opt-level = "z"      # 优先体积
-lto = true           # 跨 crate 优化，能砍掉大量未用代码
-codegen-units = 1    # 更强的优化，构建慢一点
-strip = true         # 去掉符号表
-panic = "abort"      # 去掉 unwinding 表
+opt-level = "z"        # 优先体积
+lto = "fat"            # 跨 crate 全量 LTO
+codegen-units = 1      # 更强的优化，构建慢一点
+strip = "debuginfo"    # 去掉调试信息，保留符号
+debug = false
+incremental = false
+overflow-checks = false
+panic = "abort"        # 去掉 unwinding 表
 ```
 
-当前 Windows x86_64 实测：**6.14 MB**（含 rustls + aws-lc-rs，纯 Rust TLS，无 OpenSSL 依赖）。
+Windows x86_64 实测（同样源码，两种 TLS 后端）：
 
-> 之所以保留 `opt-level = "z"` 而不是 `3`：本工具的耗时几乎全在网络 I/O，网络解析成本远大于计算，体积收益更实在。若你的场景要求极限解析性能，可改成 `opt-level = 3`，二进制大约增大 10–15%。
+| 后端 | 二进制 | 说明 |
+| --- | --- | --- |
+| `tls-rustls`（默认） | **8.80 MB** | 含 rustls + aws-lc-rs，无系统依赖，跨平台一致 |
+| `tls-native` | **6.43 MB** | 用系统 TLS（SChannel / Security / OpenSSL） |
+
+> `strip = "debuginfo"` 保留符号表，比 `strip = true` 大约多 2.4 MB。若要把体积压到极限，把 `strip` 改成 `"symbols"` 或 `true` 即可，功能完全不受影响。
+>
+> 之所以用 `opt-level = "z"` 而不是 `3`：本工具的耗时几乎全在网络 I/O，解析成本远大于计算，体积收益更实在。改成 `opt-level = 3` 大约增大 10–15%。
+
+### TLS 后端选择
+
+TLS 后端是 Cargo feature，不是硬编码：
+
+| Feature | reqwest 后端 | 平台实现 |
+| --- | --- | --- |
+| `tls-rustls`（**默认**） | `rustls` | 纯 Rust + aws-lc-rs，无系统依赖 |
+| `tls-native` | `native-tls` | Windows SChannel / macOS Security.framework / Linux OpenSSL |
+
+```bash
+cargo build --release                                          # rustls
+cargo build --release --no-default-features --features tls-native
+```
+
+必须提供这个开关的原因：rustls 的加密后端（aws-lc-rs / ring）**不支持 riscv64、mips 和 32 位 ARM**，这些架构只能用 OpenSSL。CI 里除 Windows ARM64 之外的 Linux 目标统一走 `tls-native`。
 
 ### 交叉编译
 
@@ -182,6 +213,54 @@ WEATHER_MCP_CITIES_FILE=/etc/weather-mcp-cn/cities.json weather-mcp-cn --transpo
 ```
 
 ---
+
+## CI 与发布
+
+两个 workflow，都在 `.github/workflows/`：
+
+### `ci.yml` —— 代码质量门禁
+
+| Job | 内容 |
+| --- | --- |
+| `fmt` | `cargo fmt --all -- --check` |
+| `clippy` | `cargo clippy --all-targets --locked -- -D warnings`，两套 TLS 后端各跑一遍 |
+| `test` | `ubuntu` / `windows` / `macos` 三平台 × 两套 TLS 后端（`cargo test --locked` + `--no-default-features --features tls-native`） |
+| `live` | 仅手动触发，真访问中国天气网跑 10 个联网用例 |
+
+触发：`push` 到 `main`、`pull_request`、手动。
+
+> `test` 之所以把 `tls-native` 也真跑一遍：Release 里 Linux 二进制用的就是这个后端，不能让它成为"没测过的路径"。
+
+### `build.yml` —— 交叉编译与产物分发
+
+触发方式：
+
+- **Release 发布时自动**（`release: published`）→ 构建全部目标并 `gh release upload` 自动挂到该 Release（`--clobber` 可重复上传）
+- **手动触发**（`workflow_dispatch`）→ 构建全部目标，产物作为 **Actions artifact** 供下载；若在输入框填了 `tag`，同时上传到该 Release
+
+目标矩阵（9 个）：
+
+| 目标 | 运行器 | 构建方式 | TLS |
+| --- | --- | --- | --- |
+| `x86_64-pc-windows-msvc` | `windows-latest` | 原生 | rustls |
+| `aarch64-pc-windows-msvc` | `windows-latest` | MSVC ARM64 交叉（`ilammy/msvc-dev-cmd`） | native（SChannel） |
+| `x86_64-apple-darwin` | `macos-latest` | 原生（Apple clang 交叉） | rustls |
+| `aarch64-apple-darwin` | `macos-latest` | 原生 | rustls |
+| `x86_64-unknown-linux-musl` | `ubuntu-latest` | `cross` | native（OpenSSL） |
+| `aarch64-unknown-linux-musl` | `ubuntu-latest` | `cross` | native（OpenSSL） |
+| `armv7-unknown-linux-gnueabihf` | `ubuntu-latest` | `cross` | native（OpenSSL） |
+| `riscv64gc-unknown-linux-gnu` | `ubuntu-latest` | `cross` | native（OpenSSL） |
+| `mips-unknown-linux-gnu` | `ubuntu-latest` | `cross` + `-Z build-std`（nightly，Tier-3 无预编译 std） | native（OpenSSL） |
+
+设计要点：
+
+- `fail-fast: false`：一个目标挂了不影响其它目标出产物。
+- 缓存用 `Swatinem/rust-cache`，key 带 target + feature，避免不同目标互相污染。
+- 产物命名 `weather-mcp-cn-<版本>-<target>.zip|tar.gz`，内含可执行文件 + `README.md` + `LICENSE`。
+- 手动触发时版本号取 `tag` 输入，留空则用 `0.0.0-dev.<short-sha>`。
+- 下载方式：Actions → 选一次运行 → 底部 **Artifacts** → 选对应 `weather-mcp-cn-<target>`。
+
+> 关于 `mips`：`mips-unknown-linux-gnu` 是 Rust Tier 3，rustup 不发布预编译 std，因此该 job 使用 nightly + `-Z build-std=std,panic_abort`，交叉 C 工具链与 OpenSSL 由 cross 镜像提供。
 
 ## 安装与 Codex 集成
 

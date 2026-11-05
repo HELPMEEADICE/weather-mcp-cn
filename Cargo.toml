@@ -18,11 +18,19 @@ path = "src/lib.rs"
 name = "weather-mcp-cn"
 path = "src/main.rs"
 
+[features]
+# 默认使用 rustls（纯 Rust TLS），跨平台一致、无系统依赖。
+default = ["tls-rustls"]
+tls-rustls = ["reqwest/rustls"]
+# 备用后端：Windows 走 SChannel、macOS 走 Security.framework、Linux 走系统 OpenSSL。
+# 用于 rustls 的加密后端（aws-lc-rs / ring）不支持的架构，例如 riscv64、mips、armv7。
+tls-native = ["reqwest/native-tls"]
+
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde", "clock"] }
 encoding_rs = "0.8.44"
 regex = "1.13.1"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip", "brotli", "charset", "http2"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["gzip", "brotli", "charset", "http2"] }
 rmcp = { version = "3.8.0", features = ["transport-io"] }
 schemars = { version = "1.2.3", features = ["derive", "chrono04"] }
 scraper = "0.29.0"
@@ -35,7 +43,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "std", "fmt
 
 [profile.release]
 opt-level = "z"
-lto = true
+lto = "fat"
 codegen-units = 1
-strip = true
 panic = "abort"
+strip = "debuginfo"
+debug = false
+incremental = false
+overflow-checks = false

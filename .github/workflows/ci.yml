@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "LICENSE"
+      - ".gitignore"
+      - ".gitattributes"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 格式：rustfmt
+  # ---------------------------------------------------------------------------
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------------------
+  # 静态检查：clippy（零告警门槛）
+  # ---------------------------------------------------------------------------
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: 备用 TLS 后端也要能通过 clippy
+        run: cargo clippy --all-targets --locked --no-default-features --features tls-native -- -D warnings
+
+  # ---------------------------------------------------------------------------
+  # 测试：三平台全跑，两套 TLS 后端都验
+  # ---------------------------------------------------------------------------
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test-${{ matrix.os }}
+
+      - name: cargo test（默认 tls-rustls）
+        run: cargo test --locked
+
+      # Release 里 Linux/Windows-ARM 用的是 tls-native，这里把这条路径也真跑一遍，
+      # 避免"发出去的二进制走的是没测过的 TLS 后端"。
+      - name: cargo test（tls-native）
+        run: cargo test --locked --no-default-features --features tls-native
+
+  # ---------------------------------------------------------------------------
+  # 联网冒烟：只有手动触发 + 显式勾选才会跑，避免外部站点抖动阻塞 PR
+  # ---------------------------------------------------------------------------
+  live:
+    name: live network smoke
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: live
+
+      - name: 访问中国天气网验证真实数据
+        env:
+          RUST_LOG: warn
+        run: cargo test --locked --test live_tests -- --ignored --test-threads=1 --nocapture
