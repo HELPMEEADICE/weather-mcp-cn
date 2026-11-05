@@ -117,7 +117,7 @@ jobs:
             nightly: true
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # ---------------- 版本号（用于产物命名） ----------------
       - name: Resolve version
@@ -207,8 +207,9 @@ jobs:
         shell: pwsh
         run: |
           $name = "weather-mcp-cn-$env:VERSION-${{ matrix.target }}"
-          $stage = "dist/$name"
+          $stage = "stage/$name"
           New-Item -ItemType Directory -Force $stage | Out-Null
+          New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/weather-mcp-cn${{ matrix.exe }}" $stage
           Copy-Item README.md, LICENSE $stage
           Compress-Archive -Path $stage -DestinationPath "dist/$name.zip" -Force
@@ -220,17 +221,17 @@ jobs:
         run: |
           set -euo pipefail
           name="weather-mcp-cn-${VERSION}-${{ matrix.target }}"
-          stage="dist/${name}"
-          mkdir -p "$stage"
+          stage="stage/${name}"
+          mkdir -p "$stage" dist
           cp "target/${{ matrix.target }}/release/weather-mcp-cn" "$stage/"
           cp README.md LICENSE "$stage/"
-          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          tar -C stage -czf "dist/${name}.tar.gz" "${name}"
           ls -l dist
 
       # ---------------- 产物 ----------------
       # 手动触发时从这里下载：Actions → 运行详情 → Artifacts
       - name: Upload Actions artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: weather-mcp-cn-${{ matrix.target }}
           path: dist/*
