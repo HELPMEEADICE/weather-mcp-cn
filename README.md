@@ -162,6 +162,7 @@ Windows x86_64 实测（同样源码，两种 TLS 后端）：
 | --- | --- | --- |
 | `tls-rustls`（默认） | **8.80 MB** | 含 rustls + aws-lc-rs，无系统依赖，跨平台一致 |
 | `tls-native` | **6.43 MB** | 用系统 TLS（SChannel / Security / OpenSSL） |
+| `tls-native-vendored` | **6.74 MB** | Linux 上静态链接 OpenSSL |
 
 > `strip = "debuginfo"` 保留符号表，比 `strip = true` 大约多 2.4 MB。若要把体积压到极限，把 `strip` 改成 `"symbols"` 或 `true` 即可，功能完全不受影响。
 >
@@ -174,14 +175,16 @@ TLS 后端是 Cargo feature，不是硬编码：
 | Feature | reqwest 后端 | 平台实现 |
 | --- | --- | --- |
 | `tls-rustls`（**默认**） | `rustls` | 纯 Rust + aws-lc-rs，无系统依赖 |
-| `tls-native` | `native-tls` | Windows SChannel / macOS Security.framework / Linux OpenSSL |
+| `tls-native` | `native-tls` | Windows SChannel / macOS Security.framework / Linux 系统 OpenSSL |
+| `tls-native-vendored` | `native-tls` + vendored | 同上，但 Linux 上把 OpenSSL 静态编进二进制（发布用） |
 
 ```bash
 cargo build --release                                          # rustls
 cargo build --release --no-default-features --features tls-native
+cargo build --release --no-default-features --features tls-native-vendored
 ```
 
-必须提供这个开关的原因：rustls 的加密后端（aws-lc-rs / ring）**不支持 riscv64、mips 和 32 位 ARM**，这些架构只能用 OpenSSL。CI 里除 Windows ARM64 之外的 Linux 目标统一走 `tls-native`。
+必须提供这个开关的原因：rustls 的加密后端（aws-lc-rs / ring）**不支持 riscv64、mips 和 32 位 ARM**，这些架构只能用 OpenSSL。CI 里所有 Linux 目标统一走 `tls-native-vendored` —— 交叉编译时不需要目标机预装 libssl，产物也不依赖运行时 `libssl.so`（musl 目标即完全静态）。
 
 ### 交叉编译
 
@@ -246,11 +249,11 @@ WEATHER_MCP_CITIES_FILE=/etc/weather-mcp-cn/cities.json weather-mcp-cn --transpo
 | `aarch64-pc-windows-msvc` | `windows-latest` | MSVC ARM64 交叉（`ilammy/msvc-dev-cmd`） | native（SChannel） |
 | `x86_64-apple-darwin` | `macos-latest` | 原生（Apple clang 交叉） | rustls |
 | `aarch64-apple-darwin` | `macos-latest` | 原生 | rustls |
-| `x86_64-unknown-linux-musl` | `ubuntu-latest` | `cross` | native（OpenSSL） |
-| `aarch64-unknown-linux-musl` | `ubuntu-latest` | `cross` | native（OpenSSL） |
-| `armv7-unknown-linux-gnueabihf` | `ubuntu-latest` | `cross` | native（OpenSSL） |
-| `riscv64gc-unknown-linux-gnu` | `ubuntu-latest` | `cross` | native（OpenSSL） |
-| `mips-unknown-linux-gnu` | `ubuntu-latest` | `cross` + `-Z build-std`（nightly，Tier-3 无预编译 std） | native（OpenSSL） |
+| `x86_64-unknown-linux-musl` | `ubuntu-latest` | `cross` | vendored OpenSSL（产物完全静态） |
+| `aarch64-unknown-linux-musl` | `ubuntu-latest` | `cross` | vendored OpenSSL |
+| `armv7-unknown-linux-gnueabihf` | `ubuntu-latest` | `cross` | vendored OpenSSL |
+| `riscv64gc-unknown-linux-gnu` | `ubuntu-latest` | `cross` | vendored OpenSSL |
+| `mips64-unknown-linux-gnuabi64` | `ubuntu-latest` | `cross` + `-Z build-std`（nightly，Tier-3 无预编译 std） | vendored OpenSSL |
 
 设计要点：
 
@@ -260,7 +263,9 @@ WEATHER_MCP_CITIES_FILE=/etc/weather-mcp-cn/cities.json weather-mcp-cn --transpo
 - 手动触发时版本号取 `tag` 输入，留空则用 `0.0.0-dev.<short-sha>`。
 - 下载方式：Actions → 选一次运行 → 底部 **Artifacts** → 选对应 `weather-mcp-cn-<target>`。
 
-> 关于 `mips`：`mips-unknown-linux-gnu` 是 Rust Tier 3，rustup 不发布预编译 std，因此该 job 使用 nightly + `-Z build-std=std,panic_abort`，交叉 C 工具链与 OpenSSL 由 cross 镜像提供。
+> 关于 `mips`：这里构建的是 **mips64**。32 位 `mips-unknown-linux-gnu` 在依赖层就无法编译 —— `rmcp` / `tokio` 需要 `std::sync::atomic::AtomicU64`，而 MIPS32 不提供 64 位原子操作（实测报 `E0432: unresolved import std::sync::atomic::AtomicU64`）。mips64 是 Rust Tier 3，rustup 不发布预编译 std，因此该 job 使用 nightly + `-Z build-std=std,panic_abort`。
+>
+> 实测（2026-11-05）：9 个目标全部构建成功，单目标耗时 1–3 分钟；Windows 产物解压后已验证 `--version` 与完整 MCP 协议流程可用。
 
 ## 安装与 Codex 集成
 
