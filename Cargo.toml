@@ -25,6 +25,9 @@ tls-rustls = ["reqwest/rustls"]
 # 备用后端：Windows 走 SChannel、macOS 走 Security.framework、Linux 走系统 OpenSSL。
 # 用于 rustls 的加密后端（aws-lc-rs / ring）不支持的架构，例如 riscv64、mips、armv7。
 tls-native = ["reqwest/native-tls"]
+# 同上，但 Linux 上把 OpenSSL 静态编译进来：交叉编译时不需要目标平台预装 libssl，
+# 产出的二进制也不依赖运行时 libssl/libcrypto（linux-musl 即完全静态）。
+tls-native-vendored = ["reqwest/native-tls-vendored"]
 
 [dependencies]
 chrono = { version = "0.4.45", features = ["serde", "clock"] }

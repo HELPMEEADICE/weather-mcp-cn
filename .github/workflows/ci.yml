@@ -65,6 +65,10 @@ jobs:
       - name: 备用 TLS 后端也要能通过 clippy
         run: cargo clippy --all-targets --locked --no-default-features --features tls-native -- -D warnings
 
+      # Release 里 Linux 二进制用的就是这条路径（静态 OpenSSL），必须保证可编译
+      - name: 发布用的 vendored TLS 后端也要能通过 clippy
+        run: cargo clippy --all-targets --locked --no-default-features --features tls-native-vendored -- -D warnings
+
   # ---------------------------------------------------------------------------
   # 测试：三平台全跑，两套 TLS 后端都验
   # ---------------------------------------------------------------------------
@@ -113,4 +117,8 @@ jobs:
       - name: 访问中国天气网验证真实数据
         env:
           RUST_LOG: warn
-        run: cargo test --locked --test live_tests -- --ignored --test-threads=1 --nocapture
+        run: |
+          cargo test --locked --test live_tests -- --ignored --test-threads=1 --nocapture
+          # Release 的 Linux 二进制走 vendored OpenSSL，这里把这条 TLS 路径也真跑一次
+          cargo test --locked --no-default-features --features tls-native-vendored \
+            --test live_tests -- --ignored --test-threads=1 --nocapture

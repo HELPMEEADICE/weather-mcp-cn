@@ -39,7 +39,7 @@ jobs:
             os: windows-latest
             archive: zip
             exe: ".exe"
-            features: "" # 默认 tls-rustls
+            features: tls-rustls
             cross: false
             nightly: false
 
@@ -47,8 +47,8 @@ jobs:
             os: windows-latest
             archive: zip
             exe: ".exe"
-            # Windows 上 tls-native = SChannel，纯 API 绑定，不需要为 ARM64 交叉编译 C 代码
-            features: "tls-native"
+            # Windows 上 tls-native = SChannel，纯 API 绑定，不用为 ARM64 交叉编译 C 代码
+            features: tls-native
             cross: false
             nightly: false
 
@@ -57,7 +57,7 @@ jobs:
             os: macos-latest
             archive: tar.gz
             exe: ""
-            features: ""
+            features: tls-rustls
             cross: false
             nightly: false
 
@@ -65,18 +65,19 @@ jobs:
             os: macos-latest
             archive: tar.gz
             exe: ""
-            features: ""
+            features: tls-rustls
             cross: false
             nightly: false
 
           # ---------------- Linux ----------------
-          # 全部走 cross：镜像里自带目标架构的 C 工具链与 OpenSSL，
-          # 因此统一使用 tls-native（系统 OpenSSL）。
+          # 全部走 cross。rustls 的加密后端（aws-lc-rs / ring）不支持
+          # riscv64 / mips / 32 位 ARM，因此统一使用 vendored OpenSSL：
+          # OpenSSL 会被静态编进二进制，产出物不依赖目标机的 libssl。
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             archive: tar.gz
             exe: ""
-            features: "tls-native"
+            features: tls-native-vendored
             cross: true
             nightly: false
 
@@ -84,7 +85,7 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             exe: ""
-            features: "tls-native"
+            features: tls-native-vendored
             cross: true
             nightly: false
 
@@ -92,7 +93,7 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             exe: ""
-            features: "tls-native"
+            features: tls-native-vendored
             cross: true
             nightly: false
 
@@ -100,17 +101,17 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             exe: ""
-            features: "tls-native"
+            features: tls-native-vendored
             cross: true
             nightly: false
 
-          # mips 只有 Tier 3 std（rustup 不发布），必须 nightly + build-std，
-          # 由 cross 镜像提供 mips 交叉 C 工具链与 OpenSSL。
+          # mips 是 Tier 3：rustup 不发布预编译 std，必须 nightly + build-std，
+          # 交叉 C 工具链由 cross 镜像提供。
           - target: mips-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             exe: ""
-            features: "tls-native"
+            features: tls-native-vendored
             cross: true
             nightly: true
 
@@ -156,6 +157,25 @@ jobs:
         with:
           arch: arm64
 
+      # Windows runner 的 PATH 里存在 Git 自带的 /usr/bin/link.exe（coreutils 的 link），
+      # 会抢在 MSVC link.exe 之前被 rustc 选中，导致 "extra operand ... .rlib"。
+      # 这里不去动 PATH，直接把目标链接器钉死到 MSVC 的 ARM64 link.exe。
+      - name: Pin ARM64 linker
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $root = $env:VCToolsInstallDir
+          if (-not $root) { throw "VCToolsInstallDir 未设置，msvc-dev-cmd 没有生效" }
+          $candidates = @(
+            (Join-Path $root "bin\Hostx64\arm64\link.exe"),
+            (Join-Path $root "bin\Hostarm64\arm64\link.exe")
+          )
+          $linker = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $linker) { throw "找不到 ARM64 link.exe，候选：$($candidates -join ' | ')" }
+          Write-Host "使用链接器：$linker"
+          "CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER=$linker" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Install cross
         if: ${{ matrix.cross }}
         uses: taiki-e/install-action@v2
@@ -165,30 +185,20 @@ jobs:
       - name: Cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: build-${{ matrix.target }}-${{ matrix.features || 'default' }}
+          key: build-${{ matrix.target }}-${{ matrix.features }}
 
       # ---------------- 构建 ----------------
-      - name: Resolve feature flags
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -n "${{ matrix.features }}" ]; then
-            echo "FEATURE_ARGS=--no-default-features --features ${{ matrix.features }}" >> "$GITHUB_ENV"
-          else
-            echo "FEATURE_ARGS=" >> "$GITHUB_ENV"
-          fi
-
       - name: Build (cross)
         if: ${{ matrix.cross && !matrix.nightly }}
-        run: cross build --release --locked --target ${{ matrix.target }} $FEATURE_ARGS
+        run: cross build --release --locked --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
       - name: Build (cross + build-std，Tier-3 目标)
         if: ${{ matrix.cross && matrix.nightly }}
-        run: cross build --release --locked --target ${{ matrix.target }} $FEATURE_ARGS -Z build-std=std,panic_abort
+        run: cross build --release --locked --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }} -Z build-std=std,panic_abort
 
       - name: Build (native)
         if: ${{ !matrix.cross }}
-        run: cargo build --release --locked --target ${{ matrix.target }} $FEATURE_ARGS
+        run: cargo build --release --locked --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
       # ---------------- 打包 ----------------
       - name: Package (zip)
@@ -217,7 +227,7 @@ jobs:
           ls -l dist
 
       # ---------------- 产物 ----------------
-      # 手动触发时从这里下载
+      # 手动触发时从这里下载：Actions → 运行详情 → Artifacts
       - name: Upload Actions artifact
         uses: actions/upload-artifact@v4
         with:
@@ -226,7 +236,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      # Release 触发（或手动填写 tag）时自动上传到 Release
+      # Release 触发（或手动填写了 tag）时自动上传到 Release
       - name: Upload to GitHub Release
         if: github.event_name == 'release' || inputs.tag != ''
         shell: bash
