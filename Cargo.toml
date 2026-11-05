@@ -1,0 +1,41 @@
+[package]
+name = "weather-mcp-cn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "中国天气网 MCP 服务器：纯 Rust 实现、无需 API Key 的中国天气查询 Model Context Protocol Server"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/HELPMEEADICE/weather-mcp-cn"
+keywords = ["mcp", "weather", "china", "model-context-protocol", "cli"]
+categories = ["command-line-utilities", "api-bindings"]
+
+[lib]
+name = "weather_mcp_cn"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weather-mcp-cn"
+path = "src/main.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde", "clock"] }
+encoding_rs = "0.8.44"
+regex = "1.13.1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "gzip", "brotli", "charset", "http2"] }
+rmcp = { version = "3.8.0", features = ["transport-io"] }
+schemars = { version = "1.2.3", features = ["derive", "chrono04"] }
+scraper = "0.29.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "net", "time", "sync", "signal"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "std", "fmt"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
