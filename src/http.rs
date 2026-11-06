@@ -19,6 +19,13 @@ use tracing::{debug, warn};
 use crate::config::Config;
 use crate::error::{Result, WeatherError};
 
+/// 单个响应体的字节上限。
+///
+/// 实测：城市选择器脚本约 1 MB，7 日预报页面约 3 KB，逐 3 小时页面约 67 KB。
+/// 4 MiB 已经非常宽裕；超过它说明响应根本不是我们要的东西（上游故障、被劫持、
+/// 或者返回了体积异常的页面），此时必须尽快失败，而不是先把几十 MB 读进内存。
+const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
 /// 带限速与重试的 HTTP 客户端。
 pub struct HttpClient {
     client: reqwest::Client,
@@ -86,7 +93,7 @@ impl HttpClient {
                 request = request.header("Referer", referer);
             }
 
-            let response = match request.send().await {
+            let mut response = match request.send().await {
                 Ok(response) => response,
                 Err(err) => {
                     let mapped = WeatherError::from(err);
@@ -115,13 +122,18 @@ impl HttpClient {
                     .get(reqwest::header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok())
                     .map(str::to_string);
-                let bytes = match response.bytes().await {
+                // 先看声明的长度：能提前拒绝就不必开始读。
+                if let Some(declared) = response.content_length()
+                    && declared > MAX_BODY_BYTES as u64
+                {
+                    return Err(oversized_body(url, declared as usize));
+                }
+                let bytes = match read_body_limited(&mut response, url).await {
                     Ok(bytes) => bytes,
                     Err(err) => {
-                        let mapped = WeatherError::from(err);
-                        let retryable = mapped.is_retryable();
-                        warn!(url, attempt, error = %mapped, "读取响应体失败");
-                        last_error = Some(mapped);
+                        let retryable = err.is_retryable();
+                        warn!(url, attempt, error = %err, "读取响应体失败");
+                        last_error = Some(err);
                         if retryable && attempt + 1 < attempts {
                             continue;
                         }
@@ -171,6 +183,32 @@ fn host_of(url: &str) -> String {
     let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     // 去掉端口，同一站点不同端口共享限速槽位。
     host.split(':').next().unwrap_or(host).to_string()
+}
+
+/// 分块读取响应体，超过 [`MAX_BODY_BYTES`] 就立刻放弃。
+///
+/// 不用 `response.bytes()`：那会把整个响应体一次性读进内存，没有上限。
+async fn read_body_limited(response: &mut reqwest::Response, url: &str) -> Result<Vec<u8>> {
+    let mut body: Vec<u8> = Vec::with_capacity(8 * 1024);
+    loop {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                if body.len() + chunk.len() > MAX_BODY_BYTES {
+                    return Err(oversized_body(url, body.len() + chunk.len()));
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(None) => return Ok(body),
+            Err(err) => return Err(WeatherError::from(err)),
+        }
+    }
+}
+
+/// 响应体超限错误（不是可重试错误：重试只会再读一遍）。
+fn oversized_body(url: &str, size: usize) -> WeatherError {
+    WeatherError::Parse(format!(
+        "上游响应体超过 {MAX_BODY_BYTES} 字节上限（至少 {size} 字节）：{url}"
+    ))
 }
 
 /// 把非 2xx 响应分类成具体错误。
@@ -423,5 +461,52 @@ mod tests {
         ] {
             assert!(!looks_like_blocked_agent(ua), "{ua} 应放行");
         }
+    }
+
+    /// 超限的响应体必须被拒绝，而不是先完整读进内存。
+    ///
+    /// 用本地 TCP 监听器回放一个没有 `Content-Length`、只有连接关闭分隔的超大响应，
+    /// 从而覆盖「无法靠声明长度提前拒绝」的那条路径。整个用例不访问外网。
+    #[tokio::test]
+    async fn rejects_oversized_response_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听本地端口");
+        let addr = listener.local_addr().expect("本地地址");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("接受连接");
+            let mut scratch = [0u8; 2048];
+            let _ = socket.read(&mut scratch).await;
+            let head = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n";
+            if socket.write_all(head).await.is_err() {
+                return;
+            }
+            let chunk = vec![b'a'; 64 * 1024];
+            for _ in 0..(MAX_BODY_BYTES / chunk.len() + 4) {
+                if socket.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            let _ = socket.shutdown().await;
+        });
+
+        let config = Config {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let client = HttpClient::new(&config).expect("构建客户端");
+        let url = format!("http://{addr}/huge");
+        let err = client
+            .get_text(&url, None)
+            .await
+            .expect_err("超过上限必须报错");
+        assert_eq!(err.code(), "parse_error", "超限属于响应内容不可用：{err}");
+        assert!(err.to_string().contains("字节上限"), "{err}");
+        assert!(!err.is_retryable(), "超限重试没有意义");
+
+        server.await.expect("服务端任务不应 panic");
     }
 }

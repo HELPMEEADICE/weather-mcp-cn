@@ -172,6 +172,46 @@ fn structured(result: &Value) -> Value {
     serde_json::from_str(text).expect("content[0].text 应当是 JSON")
 }
 
+/// 断言这是一个**工具错误**（`isError: true`），而不是 JSON-RPC 协议错误，
+/// 并返回它的结构化负载。
+///
+/// MCP 的约定：工具跑了但业务上失败 → `CallToolResult{isError:true}`，客户端能把
+/// 内容展示给用户/Agent；协议层故障才用 JSON-RPC `error`，很多客户端只会显示
+/// 一句「内部错误」，信息全丢。
+fn tool_error(result: &Value) -> Value {
+    assert!(
+        result.get("error").is_none(),
+        "工具执行失败不应变成 JSON-RPC 协议错误：{result}"
+    );
+    assert_eq!(
+        result.get("isError").and_then(Value::as_bool),
+        Some(true),
+        "工具执行失败必须带 isError=true：{result}"
+    );
+    let payload = result
+        .get("structuredContent")
+        .cloned()
+        .unwrap_or_else(|| panic!("工具错误必须带 structuredContent：{result}"));
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert!(!text.is_empty(), "工具错误必须带可读文本：{result}");
+    let code = payload
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("工具错误必须带稳定错误码：{payload}"));
+    assert!(
+        text.contains(code),
+        "只读 content 的客户端也应该能拿到错误码 {code}：{text}"
+    );
+    assert!(
+        payload.get("retryable").and_then(Value::as_bool).is_some(),
+        "工具错误必须说明是否可重试：{payload}"
+    );
+    payload
+}
+
 #[test]
 fn initializes_and_lists_tools() {
     let mut client = McpClient::spawn();
@@ -309,25 +349,35 @@ fn unknown_tool_is_rejected_without_crashing() {
 }
 
 #[test]
-fn invalid_city_returns_structured_error() {
+fn invalid_city_returns_tool_error_with_stable_code() {
     let mut client = McpClient::spawn();
     client.initialize();
 
-    for args in [
-        json!({"city": "不存在的城市名称"}),
-        json!({"city": ""}),
-        json!({"city": "鼓楼"}),
+    for (args, expected) in [
+        (json!({"city": "不存在的城市名称"}), "city_not_found"),
+        (json!({"city": ""}), "city_not_found"),
+        (json!({"city": "鼓楼"}), "ambiguous_city"),
+        (json!({"city": "1010101"}), "invalid_city_code"),
     ] {
-        let response = client.call_tool("get_current_weather", args);
-        let error = response.get("error").unwrap_or_else(|| {
-            panic!("非法城市应返回错误而不是伪造结果，实际：{response}");
-        });
-        let data = error.get("data").cloned().unwrap_or(Value::Null);
-        let code = data.get("code").and_then(Value::as_str).unwrap_or("");
-        assert!(
-            code == "city_not_found" || code == "ambiguous_city",
-            "错误码不对：{code} / {data}"
+        let response = client.call_tool("get_current_weather", args.clone());
+        let result = response
+            .get("result")
+            .unwrap_or_else(|| panic!("非法城市 {args} 应返回工具错误而不是协议错误：{response}"));
+        let payload = tool_error(result);
+        assert_eq!(payload["code"], expected, "错误码不对：{payload}");
+        assert_eq!(
+            payload["retryable"], false,
+            "城市解析错误不该重试：{payload}"
         );
+        assert!(
+            payload["hint"].as_str().is_some(),
+            "错误应给出恢复建议：{payload}"
+        );
+        if expected == "ambiguous_city" {
+            let candidates = payload["candidates"].as_array().expect("歧义必须给候选");
+            assert!(candidates.len() >= 2, "{payload}");
+            assert!(candidates[0]["code"].as_str().is_some());
+        }
     }
 }
 
@@ -337,7 +387,7 @@ fn missing_required_argument_is_rejected() {
     client.initialize();
 
     let response = client.call_tool("get_weather_forecast", json!({}));
-    // MCP 允许两种报错方式：JSON-RPC error，或带 isError=true 的工具结果。
+    // 参数反序列化失败由 SDK 统一处理：MCP 允许 JSON-RPC error 或 isError=true 的工具结果。
     let is_tool_error = response
         .pointer("/result/isError")
         .and_then(Value::as_bool)
@@ -346,11 +396,79 @@ fn missing_required_argument_is_rejected() {
         response.get("error").is_some() || is_tool_error,
         "缺少 city 参数应当报错，实际：{response}"
     );
-    if is_tool_error {
-        let text = response
+    let text = if is_tool_error {
+        response
             .pointer("/result/content/0/text")
             .and_then(Value::as_str)
-            .unwrap_or_default();
-        assert!(text.contains("city"), "错误信息应指出缺少的参数：{text}");
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        response.to_string()
+    };
+    assert!(text.contains("city"), "错误信息应指出缺少的参数：{text}");
+}
+
+/// 出错之后服务器必须继续服务：MCP 的 stdio 连接不能因为一次工具失败而中断。
+#[test]
+fn server_keeps_serving_after_errors() {
+    let mut client = McpClient::spawn();
+    client.initialize();
+
+    for _ in 0..3 {
+        let response = client.call_tool("get_current_weather", json!({"city": "不存在的城市"}));
+        assert!(response.get("result").is_some(), "{response}");
+        let response = client.call_tool("no_such_tool", json!({}));
+        assert!(response.get("error").is_some(), "{response}");
     }
+
+    // 仍然能正常调用工具、仍然能列工具。
+    let response = client.call_tool("search_cities", json!({"query": "苏州"}));
+    let payload = structured(
+        response
+            .get("result")
+            .unwrap_or_else(|| panic!("服务器应仍可用：{response}")),
+    );
+    assert!(payload["count"].as_u64().unwrap_or(0) > 0);
+
+    let listed = client.request("tools/list", json!({}));
+    assert_eq!(
+        tool_names(listed.get("result").expect("tools/list")).len(),
+        5
+    );
+}
+
+/// 工具在成功时仍然同时提供 `structuredContent`、`content[0].text` 和 `outputSchema`。
+#[test]
+fn tools_keep_structured_output_and_schema() {
+    let mut client = McpClient::spawn();
+    client.initialize();
+
+    let listed = client.request("tools/list", json!({}));
+    let tools = listed
+        .pointer("/result/tools")
+        .and_then(Value::as_array)
+        .expect("tools 数组");
+    for tool in tools {
+        let name = tool["name"].as_str().unwrap_or("?");
+        assert!(
+            tool.get("outputSchema").is_some(),
+            "工具 {name} 必须继续声明 outputSchema"
+        );
+    }
+
+    let response = client.call_tool("search_cities", json!({"query": "南山", "limit": 3}));
+    let result = response.get("result").expect("应成功");
+    assert!(
+        result.get("structuredContent").is_some(),
+        "成功结果必须带 structuredContent"
+    );
+    let text = result
+        .pointer("/content/0/text")
+        .and_then(Value::as_str)
+        .expect("成功结果必须带 content[0].text");
+    let from_text: Value = serde_json::from_str(text).expect("text 应是 JSON");
+    assert_eq!(
+        from_text["count"], result["structuredContent"]["count"],
+        "两条通道的内容必须一致"
+    );
 }

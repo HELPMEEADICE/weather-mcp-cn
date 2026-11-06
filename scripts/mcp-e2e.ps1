@@ -115,6 +115,7 @@ try {
     $hr = Show-Tool "get_hourly_weather" @{ city = "北京"; hours = 12 } "北京逐3小时"
     if ($hr) {
         Write-Host ("  粒度: " + $hr.resolution_hours + " 小时; 时点数: " + $hr.hours.Count)
+        Write-Host ("  请求 " + $hr.requested_hours + " 小时, 实际覆盖 " + $hr.covered_hours + " 小时 (截至 " + $hr.coverage_end + ", 基准 " + $hr.reference_time + ")")
         foreach ($h in $hr.hours) { Write-Host ("  " + $h.time + "  " + $h.weather + " " + $h.temperature_c + "°C " + $h.wind_direction + $h.wind_scale) }
     }
 
@@ -134,12 +135,25 @@ try {
         foreach ($c in $sc.cities) { Write-Host ("  " + $c.code + "  " + $c.display_name + "  [" + $c.level + "]") }
     }
 
-    # 10) 错误处理：不存在的城市
-    Write-Host "== 错误处理 =="
+    # 10) 工具错误语义：城市不存在 → isError=true + 稳定错误码（不是 JSON-RPC error）
+    Write-Host "== 工具错误语义（城市不存在） =="
     $bad = Invoke-Request "tools/call" @{ name = "get_current_weather"; arguments = @{ city = "不存在的城市" } }
-    Write-Host ("  " + ($bad.error | ConvertTo-Json -Depth 6 -Compress))
+    if ($null -ne $bad.error) {
+        Write-Host ("  UNEXPECTED JSON-RPC error: " + ($bad.error | ConvertTo-Json -Depth 6 -Compress))
+    }
+    else {
+        $err = $bad.result.structuredContent
+        if ($null -eq $err) { $err = $bad.result.content[0].text | ConvertFrom-Json }
+        Write-Host ("  isError=" + $bad.result.isError + " code=" + $err.code + " retryable=" + $err.retryable)
+        Write-Host ("  hint: " + $err.hint)
+    }
 
-    # 11) 出错后服务器仍可用
+    # 11) 协议错误语义：未知工具 → JSON-RPC error
+    Write-Host "== 协议错误（未知工具） =="
+    $unknown = Invoke-Request "tools/call" @{ name = "no_such_tool"; arguments = @{} }
+    Write-Host ("  " + ($unknown.error | ConvertTo-Json -Depth 6 -Compress))
+
+    # 12) 出错后服务器仍可用
     $again = Invoke-Request "tools/call" @{ name = "search_cities"; arguments = @{ query = "武汉" } }
     Write-Host ("  出错后仍可用: " + ($null -ne $again.result))
 

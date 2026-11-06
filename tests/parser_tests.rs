@@ -1,15 +1,24 @@
-//! 解析器测试：全部使用 2026-11-05 从中国天气网抓取的真实响应样本，
+//! 解析器测试：全部使用从中国天气网抓取的真实响应样本，
 //! 不依赖外部网络，也不会因为站点改版而随机失败（样本已落盘）。
 
 use weather_mcp_cn::models::{CityInfo, CityLevel};
 use weather_mcp_cn::providers::weather_com_cn::{
-    parse_alerts_js, parse_current_js, parse_forecast_html, parse_hourly_html,
+    cst_now, parse_alerts_payload, parse_current_js, parse_forecast_html, parse_hourly_html,
 };
 
 const CURRENT_SAMPLE: &str = include_str!("fixtures/current_sk_2d.txt");
 const FORECAST_SAMPLE: &str = include_str!("fixtures/forecast_7d_101010100.html");
 const HOURLY_SAMPLE: &str = include_str!("fixtures/hourly_1d_101010100.html");
+/// 2026-11-06 抓取的**完整**逐 3 小时页面（67 KB 原始 HTML，含大量内联脚本）。
+/// 用来验证 `hour3data` 的提取在真实体积/真实花括号密度下依然正确。
+const HOURLY_FULL_PAGE: &str = include_str!("fixtures/hourly_1d_101010100_20261106.html");
 const ALERT_SAMPLE: &str = include_str!("fixtures/alerts_dingzhi_101060101.txt");
+/// 真实返回：`var alarmDZ101010100 ={"w":[]}`，前后还夹着 `cityDZ` 数据块。
+const ALERT_EMPTY_SAMPLE: &str = include_str!("fixtures/alerts_dingzhi_empty_101010100.txt");
+/// 结构异常样本：`w` 是 `null`，必须报错而不是当成「没有预警」。
+const ALERT_NULL_SAMPLE: &str = include_str!("fixtures/alerts_dingzhi_null_w_101010100.txt");
+/// 结构异常样本：数组被截断、字符串未闭合。
+const ALERT_CORRUPT_SAMPLE: &str = include_str!("fixtures/alerts_dingzhi_corrupt_101060101.txt");
 
 fn beijing() -> CityInfo {
     CityInfo {
@@ -52,6 +61,7 @@ fn current_observation_marks_absent_fields() {
     let observation = payload.into_observation(
         beijing(),
         "https://d1.weather.com.cn/sk_2d/101010100.html".to_string(),
+        cst_now(),
     );
     // 中国天气网实况接口没有体感温度与降水概率，不能凭空编造。
     assert!(observation.feels_like_c.is_none());
@@ -190,7 +200,9 @@ fn reports_parse_error_when_hourly_block_missing() {
 
 #[test]
 fn parses_alerts_from_real_sample() {
-    let alerts = parse_alerts_js(ALERT_SAMPLE).expect("真实预警样本应可解析");
+    let alerts = parse_alerts_payload(ALERT_SAMPLE)
+        .expect("真实预警样本应可解析")
+        .alerts;
     assert!(!alerts.is_empty(), "吉林样本里应当有生效中的预警");
 
     let first = &alerts[0];
@@ -206,14 +218,76 @@ fn parses_alerts_from_real_sample() {
     );
 }
 
+/// 真实返回的空预警：`cityDZ` 数据块在前，`alarmDZ...={"w":[]}` 在后。
+#[test]
+fn real_empty_alert_response_means_no_alerts() {
+    let payload = parse_alerts_payload(ALERT_EMPTY_SAMPLE).expect("空预警是成功响应");
+    assert!(payload.alerts.is_empty());
+}
+
+/// `w:null` 绝不能当成「没有预警」。
+#[test]
+fn null_alert_field_is_a_parse_error() {
+    let err = parse_alerts_payload(ALERT_NULL_SAMPLE).expect_err("w=null 必须报错");
+    assert_eq!(err.code(), "parse_error");
+    assert!(err.to_string().contains("null"), "{err}");
+}
+
+/// 截断/损坏的预警 JSON 必须报错，而不是丢掉整条预警当作「无预警」。
+#[test]
+fn corrupt_alert_response_is_a_parse_error() {
+    let err = parse_alerts_payload(ALERT_CORRUPT_SAMPLE).expect_err("损坏 JSON 必须报错");
+    assert_eq!(err.code(), "parse_error");
+}
+
 #[test]
 fn empty_alert_list_is_not_an_error() {
-    let alerts = parse_alerts_js(r#"var alarmDZ101010100 ={"w":[]}"#).unwrap();
+    let alerts = parse_alerts_payload(r#"var alarmDZ101010100 ={"w":[]}"#)
+        .expect("空数组是成功响应")
+        .alerts;
     assert!(alerts.is_empty());
 }
 
 #[test]
 fn alerts_without_block_report_parse_error() {
-    let err = parse_alerts_js("<html>接口改版</html>").unwrap_err();
+    let err = parse_alerts_payload("<html>接口改版</html>").unwrap_err();
     assert_eq!(err.code(), "parse_error");
+}
+
+/// 完整的真实页面（67 KB，含大量内联脚本）也必须能被正确提取。
+#[test]
+fn parses_full_real_hourly_page() {
+    let bundle = parse_hourly_html(
+        HOURLY_FULL_PAGE,
+        beijing(),
+        "https://www.weather.com.cn/weather1d/101010100.shtml".to_string(),
+    )
+    .expect("完整真实页面应可解析");
+
+    assert_eq!(bundle.resolution_hours, 3);
+    assert_eq!(
+        bundle
+            .published_at
+            .expect("页面里有发布时间")
+            .format("%Y-%m-%d %H:%M")
+            .to_string(),
+        "2026-11-06 07:30"
+    );
+    assert_eq!(bundle.hours.len(), 8, "`1d` 给 8 个时点");
+    assert_eq!(
+        bundle.hours[0].time.format("%Y-%m-%d %H:%M").to_string(),
+        "2026-11-06 11:00"
+    );
+    for pair in bundle.hours.windows(2) {
+        assert_eq!((pair[1].time - pair[0].time).num_hours(), 3);
+    }
+    // 未按请求窗口裁剪：requested_hours 为 0，covered_hours 是上游总跨度。
+    assert_eq!(bundle.requested_hours, 0);
+    assert_eq!(bundle.covered_hours, 24);
+    assert_eq!(
+        bundle.source.fetched_at.offset().local_minus_utc(),
+        8 * 3600,
+        "抓取时间必须是 UTC+8"
+    );
+    assert!(bundle.source.url.ends_with("weather1d/101010100.shtml"));
 }

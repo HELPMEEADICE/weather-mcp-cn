@@ -10,13 +10,14 @@
 //! 模块划分：
 //!
 //! * [`config`]：命令行/环境变量配置；
-//! * [`error`]：错误类型与 MCP 错误映射；
-//! * [`http`]：带限速、重试、编码处理的 HTTP 层；
-//! * [`cache`]：TTL 内存缓存；
+//! * [`error`]：错误类型与 MCP 错误映射（协议错误 vs 工具错误）；
+//! * [`http`]：带限速、重试、响应体上限、编码处理的 HTTP 层；
+//! * [`cache`]：手写的 LRU + TTL 缓存与 singleflight；
 //! * [`city`]：中文地名 → 中国天气网城市代码；
 //! * [`citygen`]：城市库抓取生成器；
 //! * [`models`]：统一的天气数据模型；
 //! * [`providers`]：数据源 trait 与 `weather.com.cn` 实现；
+//! * [`window`]：逐 3 小时预报的时间窗口语义；
 //! * [`tools`] / [`server`]：MCP 工具与服务器。
 
 pub mod cache;
@@ -29,6 +30,7 @@ pub mod models;
 pub mod providers;
 pub mod server;
 pub mod tools;
+pub mod window;
 
 /// 内置城市库的原始 JSON（编译期嵌入，发布物不依赖外部文件）。
 pub const EMBEDDED_CITIES_JSON: &str = include_str!("../data/cities.json");

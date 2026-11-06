@@ -33,10 +33,26 @@ pub struct SourceInfo {
 
 impl SourceInfo {
     pub fn new(url: impl Into<String>, description: impl Into<String>) -> Self {
+        Self::new_at(
+            url,
+            description,
+            chrono::Utc::now().with_timezone(&cst_offset()),
+        )
+    }
+
+    /// 用**真实抓取时刻**构造来源信息。
+    ///
+    /// 缓存命中时必须复用第一次抓取时的 `fetched_at`，否则「抓取时间」会被
+    /// 每一次响应刷新，变成一个没有意义的字段。
+    pub fn new_at(
+        url: impl Into<String>,
+        description: impl Into<String>,
+        fetched_at: DateTime<FixedOffset>,
+    ) -> Self {
         Self {
             provider: "weather.com.cn".to_string(),
             url: url.into(),
-            fetched_at: chrono::Utc::now().with_timezone(&cst_offset()),
+            fetched_at,
             description: Some(description.into()),
             note: None,
         }
@@ -278,6 +294,19 @@ pub struct ForecastBundle {
 }
 
 /// 逐 3 小时预报结果集合。
+///
+/// # `covered_hours` 的确切语义
+///
+/// MCP 工具返回前会按 `reference_time`（本次调用的「现在」）裁剪时间窗，
+/// `covered_hours` 表示**从现在起、被返回的时点真正覆盖到的小时数**：
+///
+/// ```text
+/// coverage_end  = min(最后一个时点 + 3 小时, reference_time + requested_hours)
+/// covered_hours = floor((coverage_end - reference_time) / 1 小时)
+/// ```
+///
+/// 因此它永远不会大于 `requested_hours`，也不会大于上游实际给出的数据跨度；
+/// 上游只覆盖了一部分窗口时，这里如实给出较小的数字，不做任何「至少 3 小时」的兜底。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HourlyBundle {
     /// 城市信息。
@@ -292,8 +321,14 @@ pub struct HourlyBundle {
     pub resolution_hours: u32,
     /// 请求的小时数。
     pub requested_hours: u32,
-    /// 覆盖到的小时数（受数据源粒度影响）。
+    /// 从现在起实际被覆盖的小时数（见上方语义说明）。
     pub covered_hours: u32,
+    /// 裁剪时间窗所用的「现在」（UTC+8）。由 MCP 工具写入，便于调用方复核窗口。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reference_time: Option<DateTime<FixedOffset>>,
+    /// 最后一个返回时点所在 3 小时区间的结束时刻，且不超过请求的截止时刻。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub coverage_end: Option<DateTime<FixedOffset>>,
     /// 逐时点预报。
     pub hours: Vec<HourlyForecast>,
     /// 说明：数据源只有 3 小时粒度，未做任何插值或推算。

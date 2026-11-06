@@ -45,8 +45,9 @@ weather-mcp-cn → https://d1.weather.com.cn/sk_2d/101280604.html
 | **真实联网取数** | 所有气象数值都来自实时抓取，项目里没有任何模拟数据、硬编码天气或示例 JSON |
 | **缺失即留空** | 数据源没提供的字段（例如体感温度）用 `None` 表达并在 `missing_fields` 中列出，绝不填 0 或编造 |
 | **时间语义严格** | 明确区分「观测时间」「预报发布时间」「本地抓取时间」，绝不用抓取时间冒充观测时间 |
-| **健壮的错误处理** | 上游超时 / 403 / 429 / 5xx / 页面改版都会变成结构化 MCP 错误，服务器进程不会崩 |
-| **限速与缓存** | 同主机最小请求间隔、并发上限、指数退避重试、分级 TTL 内存缓存 |
+| **健壮的错误处理** | 工具执行失败返回 `isError=true` 的结构化工具错误（稳定错误码 + 是否可重试 + 恢复建议），只有协议层故障才走 JSON-RPC `error`；服务器进程不会崩 |
+| **LRU + TTL 缓存** | 手写 O(1) LRU + TTL，容量上限、失败不缓存、同键并发未命中只打一次上游（singleflight），缓存里**不含**任何请求上下文 |
+| **限速与重试** | 同主机最小请求间隔、并发上限、指数退避重试（超时/连接失败/403 拦截/429/5xx）、响应体 4 MiB 上限 |
 | **单文件部署** | `target/release/weather-mcp-cn`（Windows 为 `.exe`），无运行时依赖，无需数据库 |
 
 ---
@@ -57,20 +58,21 @@ weather-mcp-cn → https://d1.weather.com.cn/sk_2d/101280604.html
 src/
 ├── main.rs          CLI 入口、日志（严格写 stderr）、stdio transport 启动
 ├── lib.rs           库入口（便于集成测试引用）
-├── server.rs        MCP Server：tool_router + ServerHandler + 5 个工具
+├── server.rs        MCP Server：tool_router + ServerHandler + 5 个工具（返回 CallToolResult）
 ├── tools.rs         工具参数 / 输出结构（同时用于生成 JSON Schema）
 ├── models.rs        统一数据模型：WeatherObservation / DailyForecast / HourlyForecast / WeatherAlert / CityInfo
 ├── city.rs          中文地名 → 城市代码：层级剥离 + 模糊匹配 + 歧义处理
 ├── citygen.rs       城市库抓取生成器（--refresh-city-index）
-├── cache.rs         手写 TTL 缓存（无第三方缓存依赖）
-├── http.rs          统一 HTTP 层：连接复用、超时、限速、重试、UTF-8/GBK 解码
+├── cache.rs         手写 O(1) LRU + TTL 缓存与 singleflight（无第三方缓存依赖）
+├── window.rs        逐 3 小时预报的时间窗口语义（纯函数，可注入固定时钟）
+├── http.rs          统一 HTTP 层：连接复用、超时、限速、重试、响应体上限、UTF-8/GBK 解码
 ├── config.rs        命令行 + 环境变量配置
-├── error.rs         错误类型与 MCP 错误映射
+├── error.rs         错误类型与 MCP 错误映射（工具错误 vs 协议错误）
 └── providers/
-    ├── mod.rs       WeatherProvider trait（dyn 兼容，便于扩展其它数据源）
+    ├── mod.rs       WeatherProvider trait（dyn 兼容）+ Fetched<T> + TextFetcher
     └── weather_com_cn.rs   中国天气网实现 + 全部解析器
 data/cities.json     编译期嵌入的城市库（3221 条）
-tests/               解析器 / 城市解析 / MCP 协议 / 联网集成测试
+tests/               解析器 / 城市解析 / 缓存一致性 / MCP 协议 / 联网集成测试
 scripts/mcp-e2e.ps1  真正启动二进制并走完 stdio 协议的端到端验证脚本
 ```
 
@@ -83,17 +85,19 @@ scripts/mcp-e2e.ps1  真正启动二进制并走完 stdio 协议的端到端验�
 ```
 MCP client ──stdio JSON-RPC──▶ WeatherServer (server.rs)
                                    │ 1. CityIndex::resolve("深圳市南山区") → 101280604
-                                   │ 2. WeatherProvider::current_weather(city)
+                                   │ 2. WeatherProvider::hourly_forecast(city)
                                    ▼
                             WeatherComCn (providers/weather_com_cn.rs)
-                                   │ TTL 缓存命中？
-                                   │ 否 → HttpClient（限速 / 重试 / 解码）
+                                   │ 缓存命中？（key = 城市代码，value = 气象数据 + 抓取时间）
+                                   │ 否 → singleflight leader → HttpClient（限速 / 重试 / 体积上限 / 解码）
                                    ▼
-                            https://d1.weather.com.cn/sk_2d/101280604.html
+                            https://www.weather.com.cn/weather1d/101280604.shtml
                                    ▼
-                            解析 var dataSK={...} → WeatherObservation
+                            解析 hour3data → HourlyPayload（不含城市、不含窗口）
                                    ▼
-                            Json<T> → content[].text + structuredContent
+             绑定本次请求的 CityInfo → window::select(now, hours) → HourlyBundle
+                                   ▼
+              CallToolResult{structuredContent} 或 {isError:true, code, hint}
 ```
 
 ---
@@ -120,8 +124,8 @@ MCP client ──stdio JSON-RPC──▶ WeatherServer (server.rs)
 **使用限制与自律**：
 
 - 只读公开页面，不登录、不绕过任何访问控制、不使用验证码识别或代理池。
-- 同一主机的请求间隔默认 **350 ms**（`WEATHER_MCP_MIN_INTERVAL_MS`），并发上限默认 **4**。
-- 缓存默认值：实况 5 分钟、预报 30 分钟、逐 3 小时 30 分钟、预警 10 分钟，避免重复打上游。
+- 同一主机的请求间隔默认 **350 ms**（`WEATHER_MCP_MIN_INTERVAL_MS`），并发上限默认 **4**；超过 **4 MiB** 的响应体直接拒绝，避免异常响应把内存吃满。
+- 缓存默认值：实况 5 分钟、预报 30 分钟、逐 3 小时 30 分钟、预警 10 分钟；按「最近使用」淘汰，失败结果不缓存。
 - 数据版权归中国天气网及其数据提供方所有。本项目只做个人/内部查询用途的转发，**不得用于商业再分发**；请勿移除结果中的 `source` 字段。
 
 ---
@@ -156,13 +160,15 @@ overflow-checks = false
 panic = "abort"        # 去掉 unwinding 表
 ```
 
-Windows x86_64 实测（同样源码，两种 TLS 后端）：
+Windows x86_64 实测（Rust 1.98.1，`cargo build --release`，2026-11-06；同一台机器、同一 profile 下对 v0.1.0 与本轮改动做的 A/B）：
 
-| 后端 | 二进制 | 说明 |
-| --- | --- | --- |
-| `tls-rustls`（默认） | **8.80 MB** | 含 rustls + aws-lc-rs，无系统依赖，跨平台一致 |
-| `tls-native` | **6.43 MB** | 用系统 TLS（SChannel / Security / OpenSSL） |
-| `tls-native-vendored` | **6.74 MB** | Linux 上静态链接 OpenSSL |
+| 后端 | 改动前 | 改动后 | 变化 | 说明 |
+| --- | --- | --- | --- | --- |
+| `tls-rustls`（默认） | 9,266,203 B（8.84 MiB） | 9,292,868 B（8.86 MiB） | **+26,665 B（+0.29%）** | 含 rustls + aws-lc-rs，无系统依赖，跨平台一致 |
+| `tls-native` | 6,773,336 B（6.46 MiB） | 6,801,026 B（6.49 MiB） | **+27,690 B（+0.41%）** | 系统 TLS（SChannel / Security / OpenSSL） |
+| `tls-native-vendored` | — | 未复测 | — | Windows 上等同 SChannel；静态 OpenSSL 只在 Linux 有意义，由 CI 覆盖 |
+
+> 体积增量来自本轮新增的时间窗语义、singleflight、严格预警解析与结构化工具错误，量级 < 0.5%，没有引入任何新依赖。
 
 > `strip = "debuginfo"` 保留符号表，比 `strip = true` 大约多 2.4 MB。若要把体积压到极限，把 `strip` 改成 `"symbols"` 或 `true` 即可，功能完全不受影响。
 >
@@ -418,9 +424,33 @@ weather-mcp-cn [选项]
 | `city` | string | ✅ | 城市名称或代码 |
 | `hours` | integer | ❌ | 1–24，默认 12 |
 
-返回：`resolution_hours`（恒为 **3**）、`requested_hours`、`covered_hours`、`hours[]`（`time`、`weather`、`temperature_c`、`wind_direction`、`wind_scale`、`icon_code`）、`note`、`source`。
+返回：`resolution_hours`（恒为 **3**）、`requested_hours`、`covered_hours`、`reference_time`、`coverage_end`、`hours[]`（`time`、`weather`、`temperature_c`、`wind_direction`、`wind_scale`、`icon_code`）、`note`、`source`。
 
 > ⚠️ 中国天气网公开数据只有 3 小时粒度。本工具返回时间窗内每 3 小时一个时点，**不做任何插值**。若需要逐 1 小时数据，本数据源确实不提供。
+
+**时间窗口语义**（`src/window.rs`，用注入的固定时钟做确定性测试）：
+
+一个 `11:00` 的时点代表区间 `[11:00, 14:00)`。窗口以本次调用的「现在」（`reference_time`）为基准：
+
+| 分类 | 条件 | 处理 |
+| --- | --- | --- |
+| 过去 | `t + 3h <= now` | 丢弃，绝不返回已经作废的预报 |
+| 当前附近 | `t <= now < t + 3h` | 保留（正在生效的那份预报） |
+| 未来 | `now < t <= now + hours` | 保留 |
+| 超出窗口 | `t > now + hours` | 丢弃 |
+
+`covered_hours` 是**从现在起真正能被返回数据回答的小时数**：
+
+```text
+coverage_end  = min(最后一个时点 + 3h, reference_time + requested_hours)
+covered_hours = floor((coverage_end - reference_time) / 1h)
+```
+
+它同时被「请求的窗口」和「上游实际给出的数据」夹住，因此**永远不会被夸大**：请求 24 小时但上游只到明天凌晨时，这里会如实给出更小的值，`coverage_end` 提供对应的截止时刻便于复核。
+
+窗口内没有任何有效未来时点时，工具返回 `isError=true` 的工具错误（`code="forecast_window_unavailable"`，附 `available_from` / `available_until`），绝不返回空数组冒充「查询成功但没有数据」。
+
+时间窗按绝对时刻比较，与服务器所在时区无关；跨日、跨月、跨年、闰日都有专门用例。
 
 ### `search_cities`
 
@@ -439,7 +469,9 @@ weather-mcp-cn [选项]
 
 返回：`has_alerts`、`alerts[]`（`title`、`alert_type`、`level`、`level_code`、`type_code`、`publisher`、`published_at`、`expires_at`、`content`、`detail_url`、`region`）、`status`、`source`。
 
-> `has_alerts=false` + `status="no_active_alerts"` 表示**查询成功且确实没有预警**；数据源不可用会返回 MCP 错误。两者绝不混淆。
+> `has_alerts=false` + `status="no_active_alerts"` 表示**查询成功且确实没有预警**（上游明确返回 `{"w":[]}`）；查询失败会返回 `isError=true` 的工具错误，两者绝不混淆。
+>
+> 预警解析是严格的：`w` 缺失、`w` 是 `null`/字符串/对象、JSON 截断、返回 HTML 错误页，一律报 `parse_error`，不会被当成「没有预警」。单条预警内部字段残缺时不会丢弃整条（缺 `w13` 标题会按「区域 + 类型 + 级别」合成标题），避免静默吞掉真实预警。
 
 ---
 
@@ -504,20 +536,25 @@ weather-mcp-cn [选项]
 
 ```json
 {
+  "city": { "code": "101010100", "display_name": "北京市", "level": "municipality" },
   "resolution_hours": 3,
   "requested_hours": 12,
   "covered_hours": 12,
+  "reference_time": "2026-11-05T23:30:00+08:00",
+  "coverage_end": "2026-11-06T11:30:00+08:00",
   "hours": [
     { "time": "2026-11-05T23:00:00+08:00", "weather": "晴", "temperature_c": 5, "wind_direction": "东北风", "wind_scale": "<3级", "icon_code": "n00" },
     { "time": "2026-11-06T02:00:00+08:00", "weather": "晴", "temperature_c": 2, "wind_direction": "东南风", "wind_scale": "<3级" },
-    { "time": "2026-11-06T05:00:00+08:00", "weather": "晴", "temperature_c": 1, "wind_direction": "西风", "wind_scale": "<3级" }
+    { "time": "2026-11-06T05:00:00+08:00", "weather": "晴", "temperature_c": 1, "wind_direction": "西风", "wind_scale": "<3级" },
+    { "time": "2026-11-06T08:00:00+08:00", "weather": "晴", "temperature_c": 2, "wind_direction": "西风", "wind_scale": "<3级" },
+    { "time": "2026-11-06T11:00:00+08:00", "weather": "晴", "temperature_c": 10, "wind_direction": "西南风", "wind_scale": "<3级" }
   ],
   "note": "中国天气网公开数据为 3 小时粒度，本项目未做任何插值或推算；时间均为北京时间（UTC+8）",
   "source": { "url": "https://www.weather.com.cn/weather1d/101010100.shtml" }
 }
 ```
 
-### 预警（长春，命中 2 条）
+### 预警（长春，命中 1 条）
 
 ```json
 {
@@ -561,31 +598,89 @@ weather-mcp-cn [选项]
 | 气象预警 | 10 分钟 | 预警时效性强 |
 | 城市库 | 进程生命周期 | 编译期嵌入 / 启动时加载，刷新需重启或 `--refresh-city-index` |
 
-实现要点：
+### 策略：真正的 LRU + TTL
 
-- 手写 `TtlCache`（`Mutex<HashMap>` + `Instant` 过期时间 + 容量上限 LRU 淘汰），没有引入缓存库。
-- **只缓存成功结果**，失败不缓存——避免一次网络抖动被固化成一整段时间的错误。
+`TtlCache`（`src/cache.rs`）是手写实现，不引第三方缓存库（避免定时器与后台线程）：
+
+- **数据结构**：槽位数组 + 双向链表 + `HashMap` 索引。命中时把节点移到表头，写满容量时从表尾淘汰 —— 这是**按最近使用顺序（LRU）淘汰**，不是「按过期时间远近挑一个删掉」。
+- **复杂度**：链表操作全部 O(1)，不复制键。只有「写满容量后仍要插入」时才做一次 O(n) 的过期清理：先回收死条目，再退化为淘汰 LRU 尾节点，所以死数据不会挤掉活数据。
+- **过期**：读取时按键判断并顺手删除；`len()` 与容量压力时批量清理。
+- **容量**：`WEATHER_MCP_CACHE_CAPACITY`（默认 512，最小 8），四类缓存各自独立计数。
+- **只缓存成功结果**：失败（超时 / 5xx / 解析失败）绝不入缓存，避免一次网络抖动被固化成一整段时间的错误。
+- **不在 async 任务里长期持锁**：`std::sync::Mutex` 的临界区里没有任何 `.await`。
+- **单一抓取时刻**：命中缓存时复用第一次抓取的 `fetched_at`，不会把「响应时间」冒充成「抓取时间」。
 - 每条结果都带 `source.fetched_at`（抓取时间）与 `observed_at` / `published_at`（气象时间），调用方可自行判断新鲜度。
+
+### 缓存里到底存什么（请求上下文隔离）
+
+四个缓存的值都是 `Fetched<T>`：**只有可共享的气象数据 + 真实抓取时刻**，键是 9 位城市代码。`CityInfo`、`resolution_note`、`source.url` 这些与单次请求绑定的东西一律不进缓存，而是在每次调用返回时现场绑定：
+
+| 缓存 | Key | Value | 绑定位置 |
+| --- | --- | --- | --- |
+| 实况 | 城市代码 | `ObservationPayload` | `into_observation(city, url, fetched_at)` |
+| 逐日预报 | 城市代码 | `ForecastPayload` | `into_bundle(city, url, fetched_at)` |
+| 逐 3 小时 | 城市代码 | `HourlyPayload` | `into_bundle(city, url, fetched_at)` |
+| 气象预警 | 城市代码 | `AlertPayload` | `into_bundle(city, url, fetched_at)` |
+
+这修掉了 v0.1.0 的一个真实缺陷：以前缓存的是「完整返回对象」，于是「先查深圳市粤海街道（回退到深圳并带 `resolution_note`）」之后，「再查深圳」会错误继承那条回退说明；反过来的顺序又会丢掉应有的说明。现在类型系统直接禁止这种污染（payload 里根本没有 `CityInfo` 字段），并且有交叉查询回归测试守着。
+
+### singleflight（同键并发未命中只打一次上游）
+
+`get_or_try_insert_with` 的语义：
+
+1. 命中直接返回；
+2. 未命中时第一个调用者成为 **leader**，其余调用者在 `tokio::sync::oneshot` 上等待；
+3. leader 成功后写缓存并唤醒等待者，等待者回查缓存直接命中；
+4. leader 失败或被取消（future 被 drop）时，`FlightGuard` 在 `Drop` 里注销 inflight 表并唤醒等待者；等待者会自己接手重试（最多 3 轮），**不会死锁**；失败结果依然不入缓存。
+
+所以 4 个并发请求同一城市只会产生 1 次上游请求（见 `concurrent_misses_are_coalesced_into_one_request`）。
 
 ---
 
 ## 错误处理
 
-所有错误都映射为 MCP `ErrorData`，进程不退出：
+MCP 把失败分成两层，本项目严格区分：
 
-| `data.code` | JSON-RPC | 含义 | 处理建议 |
-| --- | --- | --- | --- |
-| `city_not_found` | -32602 | 城市名/代码无法定位 | 调用 `search_cities` 或改用 9 位代码 |
-| `ambiguous_city` | -32602 | 名称命中多个行政区（`data.candidates` 给出候选） | 用更完整的名称，如 `深圳市南山区` |
-| `invalid_city_code` | -32602 | 代码格式不合法 | 应为 101 开头的 9 位数字 |
-| `unsupported_data` | -32602 | 数据源明确不提供该数据 | 换查询口径 |
-| `upstream_status` | -32603 | 上游返回 429 / 5xx 或普通 404 | 检查城市代码；稍后重试 |
-| `upstream_blocked` | -32603 | 被中国天气网 CDN 拦截（`Forbid_code=020200` 表示 Referer 不合规，`020300` 表示 User-Agent 不合规） | 见[常见问题](#常见问题)里的 403 排查 |
-| `upstream_unavailable` | -32603 | 连接失败 / 数据源结构异常 | 稍后重试 |
-| `timeout` | -32603 | 请求超时 | 稍后重试或调大 `WEATHER_MCP_REQUEST_TIMEOUT_SECS` |
-| `parse_error` | -32603 | 页面结构变化导致解析失败 | 提 issue，附 `source.url` |
+| 层 | 返回方式 | 例子 |
+| --- | --- | --- |
+| **协议层故障** | JSON-RPC `error`（`ErrorData`） | 未知工具名、报文不是合法 JSON-RPC、工具参数反序列化失败 |
+| **工具执行失败** | `CallToolResult { isError: true }` + `structuredContent` | 城市不存在 / 有歧义、上游超时、HTTP 403/429/5xx、页面改版、时间窗未覆盖 |
 
-重试策略：仅对**超时 / 429 / 5xx** 重试，指数退避 `300ms × 2^n`（含抖动，上限 4s），默认最多 2 次；403/404 不重试。
+工具错误的结构（以城市歧义为例）：
+
+```json
+{
+  "code": "ambiguous_city",
+  "kind": "ambiguous",
+  "message": "城市名称「鼓楼」存在歧义，命中 12 个行政区划，请使用更完整的名称或直接使用城市代码",
+  "provider": "weather.com.cn",
+  "retryable": false,
+  "hint": "从 candidates 里选一个 code，或改用「省+市+区」的完整名称重试",
+  "query": "鼓楼",
+  "candidates": [
+    { "code": "101190111", "name": "鼓楼", "display_name": "江苏省南京市鼓楼区", "level": "district" }
+  ]
+}
+```
+
+同样的 JSON 也会写进 `content[0].text`，因此不读 `structuredContent` 的客户端一样能看到错误码与说明。
+
+| `code` | `kind` | `retryable` | 含义 | 处理建议 |
+| --- | --- | --- | --- | --- |
+| `city_not_found` | not_found | ❌ | 城市名 / 代码无法定位 | 调 `search_cities` 或改用 9 位代码 |
+| `ambiguous_city` | ambiguous | ❌ | 名称命中多个行政区（`candidates` 给候选） | 用更完整的名称，如 `深圳市南山区` |
+| `invalid_city_code` | invalid_input | ❌ | 代码格式不合法 | 101 开头 9 位数字 |
+| `unsupported_data` | unavailable | ❌ | 数据源明确不提供该数据 / 上游没返回预报 | 换查询口径 |
+| `forecast_window_unavailable` | unavailable | ❌ | 请求时间窗没有任何有效未来时点（附 `available_from` / `available_until`） | 缩小 `hours`，或改用逐日预报 |
+| `upstream_status` | upstream | 5xx / 429 时 ✅ | 上游返回非预期状态码（含 404） | 检查城市代码；稍后重试 |
+| `upstream_blocked` | upstream | ✅ | 被 CDN 拦截（`Forbid_code=020200` 表示 Referer 不合规，`020300` 表示 User-Agent 不合规） | 见[常见问题](#常见问题)里的 403 排查 |
+| `upstream_unavailable` | upstream | ✅ | 连接失败 / 响应无法识别 | 稍后重试 |
+| `timeout` | upstream | ✅ | 请求超时 | 稍后重试或调大 `WEATHER_MCP_REQUEST_TIMEOUT_SECS` |
+| `parse_error` | upstream_format | ❌ | 页面 / 接口结构变化导致解析失败 | 提 issue，附 `source.url` |
+
+**任何工具执行错误都不会让进程退出**：`server_keeps_serving_after_errors` 会连续触发 6 次失败调用（工具错误 + 未知工具），然后确认服务器仍能正常列工具、正常查询。
+
+HTTP 层重试策略：只对**可恢复的上游故障**重试——超时、连接失败、CDN 拦截、429、5xx；指数退避 `300ms × 2^n`（含抖动，上限 4s），默认最多 2 次。403/404（非拦截）、解析失败、响应体超限都不重试。响应体上限 **4 MiB**，超限立刻失败，不把异常响应读进内存。
 
 日志全部走 stderr（`RUST_LOG` 控制），**stdout 只输出 MCP 协议消息**。
 
@@ -597,25 +692,49 @@ weather-mcp-cn [选项]
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+cargo clippy --all-targets --locked --no-default-features --features tls-native -- -D warnings
+cargo test --locked --no-default-features --features tls-native
+cargo clippy --all-targets --locked --no-default-features --features tls-native-vendored -- -D warnings
 ```
 
-当前结果：
+当前结果（Windows x86_64，Rust 1.98.1，三套 TLS feature 结果一致）：
 
 | 目标 | 数量 | 内容 |
 | --- | --- | --- |
-| `src/lib.rs` 单元测试 | 25 | 解析器、缓存、编码解码、城市后缀、时间解析 |
-| `tests/parser_tests.rs` | 11 | 用**真实抓取样本**离线验证四个解析器 |
-| `tests/city_tests.rs` | 12 | 用内置 3221 条城市库验证名称/代码/层级/歧义解析 |
-| `tests/mcp_tests.rs` | 5 | **真正启动二进制**，走 stdio 协议 `initialize` → `tools/list` → `tools/call` |
+| `src/lib.rs` 单元测试 | 83 | LRU/TTL 淘汰（含链表不变量校验）与 singleflight、窗口语义（跨日/月/年/闰日/时区/1-3-12-24 小时）、预警异常结构、HTTP 体积上限、解析器、城市后缀 |
+| `tests/parser_tests.rs` | 15 | **真实抓取样本**离线验证四个解析器，含空预警/`w:null`/损坏 JSON 与 67 KB 完整页面 |
+| `tests/city_tests.rs` | 12 | 内置 3221 条城市库的名称/代码/层级/歧义解析 |
+| `tests/provider_cache_tests.rs` | 6 | **真实缓存实现** + 回放样本：交叉查询上下文隔离、命中不打上游、并发 singleflight、失败不缓存 |
+| `tests/mcp_tests.rs` | 7 | **真正启动二进制**走 stdio：`initialize` → `tools/list` → `tools/call` → 工具错误语义 → 出错后继续服务 |
 | `tests/live_tests.rs` | 14 | 联网集成测试（含 403/CDN 拦截回归），默认 `#[ignore]` |
 
-`cargo test` 汇总：**60 passed, 0 failed, 14 ignored**。
+`cargo test` 汇总：**123 passed, 0 failed, 14 ignored**（`--no-default-features --features tls-native` 组合同样全绿）。
 
-`tests/fixtures/` 里保存了 2026-11-05 抓取的真实响应样本（实况 / 7 日预报 / 逐 3 小时 / 预警），因此这些解析测试既离线又真实。
+关键回归用例：
+
+| 用例 | 守护的行为 |
+| --- | --- |
+| `city_context_is_bound_per_request_in_every_cache` | 同一城市代码的两次查询各自绑定自己的 `resolution_note`（四类缓存全覆盖） |
+| `fallback_note_appears_when_a_later_request_needs_it` | 反序查询时回退说明必须出现，且第二次命中缓存 |
+| `concurrent_misses_are_coalesced_into_one_request` | 4 个并发同键请求只打 1 次上游 |
+| `cancelled_leader_lets_a_waiter_take_over` | leader 被取消后等待者不死锁并接手 |
+| `evicts_least_recently_used_key` / `lru_order_survives_many_evictions` / `expired_entries_are_reclaimed_before_live_ones` | LRU 淘汰顺序、连续淘汰后链表不变量自洽、「死条目不挤掉活条目」 |
+| `hours_one_three_twelve_twenty_four` / `crosses_month_and_year_boundary` / `reports_miss_*` | 窗口裁剪与覆盖时长的精确语义 |
+| `alert_null_w_is_an_error_not_empty` / `corrupt_alert_response_is_a_parse_error` | 「没有预警」与「查询失败」不混淆 |
+| `invalid_city_returns_tool_error_with_stable_code` | 工具错误走 `isError: true` + 稳定错误码，而不是 JSON-RPC 错误 |
+| `server_keeps_serving_after_errors` | 连续失败后服务器仍然可用 |
+
+`tests/fixtures/` 里保存了从中国天气网抓取的真实响应样本（实况 / 7 日预报 / 逐 3 小时 / 完整逐 3 小时页面 / 预警 / 空预警），因此这些解析测试既离线又真实。
 
 `tests/mcp_tests.rs` 不是直接调用 Rust 函数：它用 `CARGO_BIN_EXE_weather-mcp-cn` 启动真实进程，按行收发 JSON-RPC，并断言 stdout 的每一行都是合法 JSON-RPC 2.0 消息（协议流未被日志污染）。
+
+### 与 TLS feature 相关的说明
+
+- `tls-rustls`（默认）与 `tls-native` 在本机都完整跑过 fmt/clippy/test。
+- `tls-native-vendored` 在本机通过 clippy；但 Windows 上 `native-tls` 走的是 SChannel，`vendored` 只影响 Linux/BSD 的 OpenSSL 构建，因此**静态 OpenSSL 这条路径只能由 CI 的 Linux 任务验证**（`.github/workflows/ci.yml` 与 `build.yml` 里就是这样做的），本机不做「vendored 一定静态链接成功」的宣称。
+- 交叉编译目标（aarch64 / armv7 / riscv64 / mips64 / macOS）在本机无法运行，只能由 GitHub Actions 覆盖，不在此处宣称本地验证通过。
 
 ### 联网集成测试
 
@@ -623,7 +742,7 @@ cargo test
 cargo test --test live_tests -- --ignored --test-threads=1 --nocapture
 ```
 
-覆盖：北京实况（含观测时间新鲜度校验）、上海 3 天预报、广州 7 天预报、武汉/深圳南山城市解析、逐 3 小时粒度校验、预警三态（有/无/不可用）、不存在城市、无效城市代码、超时上报、城市库源可达。
+覆盖：北京实况（含观测时间新鲜度校验）、上海 3 天预报、广州 7 天预报、武汉/深圳南山城市解析、逐 3 小时粒度校验、预警三态（有/无/不可用）、不存在城市、无效城市代码、超时上报、城市库源可达。请求间隔由 `HttpClient` 的限速器保证，只做串行小样本验证，不做压力测试。
 
 ### 端到端脚本
 
@@ -670,6 +789,12 @@ pwsh -File scripts/mcp-e2e.ps1 -Binary target\release\weather-mcp-cn.exe
 **Q：Windows 上被杀软报毒 / 启动慢？**
 二进制未做签名。首次启动可能被杀软扫描；必要时加白名单。服务器启动不做任何网络请求（城市库已内嵌），`initialize` 应在毫秒级完成。
 
+**Q：为什么工具调用返回的是 `isError: true` 而不是 JSON-RPC 错误？**
+这是 MCP 规范的推荐做法：请求本身合法、工具也确实执行了，只是业务上失败（城市不存在、上游超时、时间窗没数据），这类信息属于「工具结果」，客户端会把 `content` 展示给模型，模型据此改写查询或重试。只有请求无法路由/解析（未知工具名、报文不是合法 JSON-RPC、参数反序列化失败）才是 JSON-RPC `error`——那种情况下客户端往往只显示一句「内部错误」，信息全丢。`structuredContent.code` 是稳定错误码，`retryable` 与 `hint` 直接告诉 Agent 该不该重试。
+
+**Q：为什么 `covered_hours` 小于我请求的 `hours`？**
+两种可能：上游只提供了有限时点（例如 `hour1d` 只给 24 小时），或者最后一个时点的 3 小时区间在截止时刻前就结束了。`covered_hours` 只统计**从现在起真正有数据可答**的整小时数，`coverage_end` 给出对应截止时刻；项目不会用 `max(3)` 之类的手段把数字凑大。
+
 **Q：能在 CI 里跑吗？**
 可以。`cargo test` 完全离线；只有 `--ignored` 的联网用例需要出网。
 
@@ -677,14 +802,15 @@ pwsh -File scripts/mcp-e2e.ps1 -Binary target\release\weather-mcp-cn.exe
 
 ## 已知限制
 
-1. **逐小时精度**：上游只有 3 小时粒度，`get_hourly_weather` 的输出就是 3 小时一个点。这不是实现缺陷，是数据源边界。
+1. **逐小时精度**：上游只有 3 小时粒度，`get_hourly_weather` 的输出就是 3 小时一个点。窗口只保留仍然覆盖未来的时点，`covered_hours` 只统计真正能回答的小时数——这不是实现缺陷，是数据源边界。
 2. **体感温度 / 降水概率 / 分钟级降水**：上游公开接口没有，一律留空。
 3. **区县覆盖**：内置 3221 条，覆盖到区县；但个别街道/乡镇级地名没有独立站点，此时如实退回到上级行政区并在 `resolution_note` 说明，不编造代码。
 4. **区县显示名后缀**：中国天气网只给简称（如「和林」「托县」），`display_name` 会按常见后缀补全，个别会与实际行政区名略有出入；`province` / `city` / `district` / `code` 均为原始数据，未加工。
 5. **Streamable HTTP 模式**：`--transport http` 已预留但尚未实现，当前只提供 stdio。
 6. **站点改版的脆弱性**：预报/逐 3 小时依赖 HTML 结构，上游改版会导致 `parse_error`（明确报错，不会返回假数据）。数据接口（`dataSK` / `alarmDZ` / `hour3data`）是 JSON，稳定得多。
 7. **请求头由 CDN 把关**：改了 `WEATHER_MCP_USER_AGENT` 或走了会改写请求头的代理，可能触发 403（`upstream_blocked`）。默认配置实测不受影响。
-7. **时区**：所有时间统一按北京时间（UTC+8）输出，与服务器所在时区无关。
+8. **时区**：所有时间统一按北京时间（UTC+8）输出，与服务器所在时区无关。
+9. **城市模糊匹配**：仅用于把地名映射成城市代码，命中不确定时宁可报 `ambiguous_city` 也不猜；`resolve` 会对全部 3221 条条目做一次扫描（每进程为数不多的调用，尚未做索引化，属于已知的性能上限）。
 
 ---
 

@@ -296,6 +296,11 @@ pub struct CitiesFile {
 pub struct CityIndex {
     entries: Vec<CityEntry>,
     by_code: HashMap<String, usize>,
+    /// 去重后的省级名称 `(简称, 完整名)`。
+    ///
+    /// 省级行政区只有 34 个，单独存一张小表后，「剥离省前缀」就从「遍历 3221 条
+    /// 记录并为每条拼一次完整省名」变成「遍历 34 条」，也不再有逐条字符串分配。
+    provinces: Vec<(String, String)>,
     generated_at: String,
     source: String,
 }
@@ -316,6 +321,7 @@ impl CityIndex {
         Self {
             entries: Vec::new(),
             by_code: HashMap::new(),
+            provinces: Vec::new(),
             generated_at: "unknown".to_string(),
             source: "unknown".to_string(),
         }
@@ -346,9 +352,18 @@ impl CityIndex {
         for (index, entry) in entries.iter().enumerate() {
             by_code.insert(entry.code.clone(), index);
         }
+        let mut names: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for entry in &entries {
+            names.insert(entry.province.as_str());
+        }
+        let provinces: Vec<(String, String)> = names
+            .into_iter()
+            .map(|name| (name.to_string(), province_display(name)))
+            .collect();
         Self {
             entries,
             by_code,
+            provinces,
             generated_at,
             source,
         }
@@ -570,24 +585,20 @@ impl CityIndex {
     }
 
     fn strip_province<'a>(&self, query: &'a str) -> (Option<String>, &'a str) {
-        let mut best: Option<(usize, String)> = None;
-        for entry in &self.entries {
-            for form in [entry.province.clone(), entry.province_display()] {
-                if form.is_empty() || !query.starts_with(&form) {
+        let mut best: Option<(usize, &str)> = None;
+        for (short, display) in &self.provinces {
+            for form in [short.as_str(), display.as_str()] {
+                if form.is_empty() || !query.starts_with(form) {
                     continue;
                 }
                 let len = form.len();
-                let better = match &best {
-                    Some((best_len, _)) => len > *best_len,
-                    None => true,
-                };
-                if better {
-                    best = Some((len, entry.province.clone()));
+                if best.is_none_or(|(best_len, _)| len > best_len) {
+                    best = Some((len, short.as_str()));
                 }
             }
         }
         match best {
-            Some((len, province)) => (Some(province), &query[len..]),
+            Some((len, short)) => (Some(short.to_string()), &query[len..]),
             None => (None, query),
         }
     }
