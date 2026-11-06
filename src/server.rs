@@ -28,7 +28,7 @@ weather-mcp-cn 通过中国天气网（www.weather.com.cn）的公开页面与�
 1. city 参数既可以是中文名称（北京、深圳市南山区、湖北省武汉市），也可以是 9 位城市代码；不确定时先调用 search_cities。\n\
 2. get_current_weather 返回的是气象站实况观测，带观测时间；数据源不提供体感温度、降水概率，这些字段不会出现。\n\
 3. get_weather_forecast 最多 7 天，来自 7 日预报页面。\n\
-4. get_hourly_weather 的数据粒度是 3 小时（数据源不提供逐 1 小时预报），只返回仍然覆盖未来的时点；requested_hours / covered_hours / reference_time 说明窗口与真实覆盖时长。\n\
+4. get_hourly_weather 的数据粒度是 3 小时（数据源不提供逐 1 小时预报），只返回仍然覆盖未来的时点，绝不插值。requested_hours / covered_hours（窗口内累计被覆盖的小时数）/ contiguous_hours（从现在起连续被覆盖的小时数）/ reference_time 一起说明窗口与真实覆盖时长；两者不相等就说明窗口里有数据缺口。\n\
 5. get_weather_alerts 中 has_alerts=false 与查询失败是两种不同状态，请分别处理。\n\
 6. 工具执行失败会返回 isError=true 的结果，其中 structuredContent.code 是稳定错误码（city_not_found / ambiguous_city / timeout / parse_error 等），retryable 与 hint 说明该不该重试、怎么改写查询。\n\
 所有结果都带 source.url 与抓取时间，请勿把抓取时间当成观测时间。";
@@ -169,7 +169,7 @@ impl WeatherServer {
     /// 查询指定城市未来逐 3 小时天气（数据源为 3 小时粒度）。
     #[tool(
         name = "get_hourly_weather",
-        description = "查询中国城市未来天气的逐时点预报。重要：中国天气网公开数据只有 3 小时粒度，本工具返回时间窗内每 3 小时一个时点，绝不插值或推算。hours 取值 1-24，默认 12。返回 requested_hours、covered_hours（从现在起真正被覆盖的小时数）、reference_time（裁剪窗口所用的当前时刻）与 hours 数组。窗口内没有任何有效未来时点时会返回 isError=true 的工具错误。",
+        description = "查询中国城市未来天气的逐时点预报。重要：中国天气网公开数据只有 3 小时粒度，本工具返回时间窗内每 3 小时一个时点，绝不插值或推算。hours 取值 1-24，默认 12。返回 requested_hours、covered_hours（窗口内累计被数据覆盖的小时数，不把缺口算进去）、contiguous_hours（从 reference_time 起连续被覆盖的小时数）、reference_time（裁剪窗口所用的当前时刻）与 hours 数组；covered_hours 与 contiguous_hours 不相等说明窗口内存在数据缺口。窗口内没有任何有效未来时点时会返回 isError=true 的工具错误。",
         output_schema = schema_for_output::<HourlyBundle>()
     )]
     async fn get_hourly_weather(
@@ -186,6 +186,7 @@ impl WeatherServer {
                     bundle.hours = selection.points;
                     bundle.requested_hours = hours;
                     bundle.covered_hours = selection.covered_hours;
+                    bundle.contiguous_hours = Some(selection.contiguous_hours);
                     bundle.reference_time = Some(selection.reference_time);
                     bundle.coverage_end = Some(selection.coverage_end);
                     Ok(bundle)
@@ -394,6 +395,7 @@ mod tests {
                     resolution_hours: 3,
                     requested_hours: 0,
                     covered_hours: 0,
+                    contiguous_hours: None,
                     reference_time: None,
                     coverage_end: None,
                     // 故意不排序、并塞一个重复点：窗口函数必须自己保证顺序与去重。
@@ -522,12 +524,45 @@ mod tests {
         let payload = payload(&result);
         assert_eq!(payload["requested_hours"], 12);
         assert_eq!(payload["covered_hours"], 12);
+        assert_eq!(payload["contiguous_hours"], 12, "数据连续，两者相等");
         assert_eq!(payload["reference_time"], "2026-11-05T23:30:00+08:00");
         assert_eq!(payload["coverage_end"], "2026-11-06T11:30:00+08:00");
         let hours = payload["hours"].as_array().expect("hours 数组");
         assert_eq!(hours.len(), 5, "23/02/05/08/11 五个时点");
         assert_eq!(hours[0]["time"], "2026-11-05T23:00:00+08:00");
         assert_eq!(hours[4]["time"], "2026-11-06T11:00:00+08:00");
+    }
+
+    /// 上游数据中间有缺口时，工具输出必须同时给出「累计覆盖」与「连续覆盖」，
+    /// 且都不能等于请求的 12 小时。
+    #[tokio::test]
+    async fn hourly_tool_distinguishes_total_and_contiguous_coverage() {
+        // 23:00（覆盖到 02:00）与 05:00（覆盖到 08:00），02:00~05:00 没有数据。
+        let mut points = hourly_points(23, 1);
+        points.extend(hourly_points(5, 1));
+        points[1].time = cst_offset()
+            .with_ymd_and_hms(2026, 11, 6, 5, 0, 0)
+            .single()
+            .expect("合法时间");
+
+        let provider = Arc::new(FakeProvider::new(points));
+        let server = server(provider, fixed_clock(23, 30));
+
+        let result = server
+            .get_hourly_weather(Parameters(HourlyQuery {
+                city: "北京".into(),
+                hours: Some(12),
+            }))
+            .await
+            .expect("工具调用本身不应报协议错误");
+
+        let payload = payload(&result);
+        assert_eq!(payload["requested_hours"], 12);
+        // [23:30,02:00) = 2.5h，[05:00,08:00) = 3h → 合计 5.5h → 5。
+        assert_eq!(payload["covered_hours"], 5, "{payload}");
+        assert_eq!(payload["contiguous_hours"], 2, "{payload}");
+        assert_eq!(payload["coverage_end"], "2026-11-06T08:00:00+08:00");
+        assert_eq!(payload["hours"].as_array().map(Vec::len), Some(2));
     }
 
     #[tokio::test]

@@ -4,34 +4,127 @@
 //! * 复用连接池（同一个 [`reqwest::Client`]）；
 //! * 连接超时 + 整体超时；
 //! * 全局并发上限（信号量）与「同一目标最小请求间隔」（礼貌抓取）；
+//! * **所有**响应路径（2xx / 非 2xx）的统一有界读取；
 //! * 有上限的指数退避重试（只对超时 / 429 / 5xx 重试）；
 //! * 正确解码 UTF-8 与 GBK/GB18030 网页。
+//!
+//! # 限速与并发的获取顺序
+//!
+//! 旧实现先 `wait_for_slot()` 预约一个时间片，再去抢全局信号量。问题在于「预约时刻」
+//! 不等于「实际发送时刻」：信号量被占满时，排队者会在预约时刻上先耗尽等待，等许可
+//! 集中放行时再一起把请求打出去，同主机的真实发送间隔被压缩到接近 0。
+//!
+//! 现在的顺序是（见 [`HttpClient::get_text`]）：
+//!
+//! 1. 先进入**主机独占区**（[`HostLimiter::enter`]）：同一主机同一时刻只有一个请求
+//!    在这里排队等自己的时间片 —— 限速等待期间不占用任何并发许可；
+//! 2. 再申请全局并发许可：许可证只在真正要发请求时才持有；
+//! 3. 拿到许可、真正发送之前调用 [`HostLease::anchor`]，把「下一次最早发送时刻」锚定在
+//!    `Instant::now()`，因此记录的是**真实发送时刻**而不是预约时刻；
+//! 4. 锚定后立刻释放主机独占区，让同主机的下一个请求开始等它自己的时刻，而本次请求
+//!    继续带着并发许可读响应体。
+//!
+//! 不同主机的独占区互不相关，可以并行推进。
 //!
 //! 本项目不做任何访问控制规避：不换代理池、不伪造验证码、不并发轰炸单一站点。
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, Semaphore};
 use tracing::{debug, warn};
 
 use crate::config::Config;
 use crate::error::{Result, WeatherError};
 
-/// 单个响应体的字节上限。
+/// 成功响应的字节上限。
 ///
 /// 实测：城市选择器脚本约 1 MB，7 日预报页面约 3 KB，逐 3 小时页面约 67 KB。
 /// 4 MiB 已经非常宽裕；超过它说明响应根本不是我们要的东西（上游故障、被劫持、
 /// 或者返回了体积异常的页面），此时必须尽快失败，而不是先把几十 MB 读进内存。
-const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+
+/// 非 2xx 响应的字节上限。
+///
+/// 错误页面只用来区分「CDN 拦截」与「普通错误状态」：`X-CCDN-FORBID-CODE` 在响应头里，
+/// 页面里的 `Forbid_code:` 实测出现在开头几百字节内。32 KiB 足以覆盖任何真实错误页，
+/// 又保证异常 403 / 429 / 5xx 页面不会把内存拖垮。
+pub(crate) const MAX_ERROR_BODY_BYTES: usize = 32 * 1024;
+
+/// 取锁，锁中毒时继续使用内部数据（限速表不承载跨字段不变量）。
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 同一主机的发送闸门。
+///
+/// 每个主机一把异步互斥量，值是该主机「下一次最早允许发送的时刻」。
+struct HostLimiter {
+    gates: Mutex<HashMap<String, Arc<AsyncMutex<Instant>>>>,
+    min_interval: Duration,
+}
+
+/// 已经进入某主机独占发送区的凭据。
+///
+/// 持有期间同一主机的其它请求会在 [`HostLimiter::enter`] 里排队，因此 `anchor` 一定
+/// 是串行执行的 —— 不存在两个请求同时把时间锚到同一个瞬间。
+struct HostLease {
+    next_allowed: OwnedMutexGuard<Instant>,
+    min_interval: Duration,
+}
+
+impl HostLease {
+    /// 把「下一次最早发送时刻」锚定到**现在**。
+    ///
+    /// 调用点必须紧贴真正的 `send()`：这里记录的就是真实发送时刻，下一个同主机请求会
+    /// 等到 `此刻 + min_interval`，从而保证两次实际发送之间满足最小间隔。
+    fn anchor(&mut self) {
+        *self.next_allowed = Instant::now() + self.min_interval;
+    }
+}
+
+impl HostLimiter {
+    fn new(min_interval: Duration) -> Self {
+        Self {
+            gates: Mutex::new(HashMap::new()),
+            min_interval,
+        }
+    }
+
+    /// 进入主机独占区：等到该主机允许发送的时刻再返回凭据。
+    ///
+    /// 取消安全：排队或 sleep 期间被 drop 不会留下任何状态（`next_allowed` 只在
+    /// [`HostLease::anchor`] 里被改写，而它发生在真正发送之前）。
+    async fn enter(&self, host: &str) -> HostLease {
+        let gate = {
+            // 同步锁只用于取出（或创建）该主机的闸门，绝不跨越 await。
+            let mut gates = lock(&self.gates);
+            Arc::clone(
+                gates
+                    .entry(host.to_string())
+                    .or_insert_with(|| Arc::new(AsyncMutex::new(Instant::now()))),
+            )
+        };
+
+        // 异步锁可以安全地跨越挂起点；`lock_owned` 避免了「自引用」的结构问题。
+        let next_allowed = gate.lock_owned().await;
+        let now = Instant::now();
+        if *next_allowed > now {
+            tokio::time::sleep(*next_allowed - now).await;
+        }
+        HostLease {
+            next_allowed,
+            min_interval: self.min_interval,
+        }
+    }
+}
 
 /// 带限速与重试的 HTTP 客户端。
 pub struct HttpClient {
     client: reqwest::Client,
     semaphore: Semaphore,
-    throttle: Mutex<HashMap<String, Instant>>,
-    min_interval: Duration,
+    hosts: HostLimiter,
     max_retries: u32,
 }
 
@@ -59,8 +152,7 @@ impl HttpClient {
         Ok(Self {
             client,
             semaphore: Semaphore::new(config.max_concurrency.max(1)),
-            throttle: Mutex::new(HashMap::new()),
-            min_interval: config.min_request_interval,
+            hosts: HostLimiter::new(config.min_request_interval),
             max_retries: config.max_retries,
         })
     }
@@ -80,13 +172,17 @@ impl HttpClient {
                 tokio::time::sleep(backoff).await;
             }
 
-            self.wait_for_slot(&host).await;
-
+            // 1) 先在主机独占区里等到允许发送的时刻（不占并发许可）。
+            let mut lease = self.hosts.enter(&host).await;
+            // 2) 再申请全局并发许可。
             let _permit = self
                 .semaphore
                 .acquire()
                 .await
                 .map_err(|_| WeatherError::Upstream("HTTP 并发控制已关闭".to_string()))?;
+            // 3) 真正发送之前锚定时刻，然后让出主机独占区。
+            lease.anchor();
+            drop(lease);
 
             let mut request = self.client.get(url).header("Accept", "*/*");
             if let Some(referer) = referer {
@@ -110,25 +206,19 @@ impl HttpClient {
             let status = response.status();
             let code = status.as_u16();
             // CDN 会在响应头里打上 Forbid 标识，先取下来再消费响应体。
-            let forbid_header = response
-                .headers()
-                .get("x-ccdn-forbid-code")
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_string);
+            let forbid_header = header_value(&response, "x-ccdn-forbid-code");
+            // 成功与失败都要解码，因此统一取一次 Content-Type。
+            let content_type = header_value(&response, "content-type");
 
             if status.is_success() {
-                let content_type = response
-                    .headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_string);
                 // 先看声明的长度：能提前拒绝就不必开始读。
                 if let Some(declared) = response.content_length()
                     && declared > MAX_BODY_BYTES as u64
                 {
                     return Err(oversized_body(url, declared as usize));
                 }
-                let bytes = match read_body_limited(&mut response, url).await {
+                let read = read_body_capped(&mut response, MAX_BODY_BYTES).await;
+                let bytes = match read.into_ok(url) {
                     Ok(bytes) => bytes,
                     Err(err) => {
                         let retryable = err.is_retryable();
@@ -143,9 +233,27 @@ impl HttpClient {
                 return Ok(decode_body(&bytes, content_type.as_deref()));
             }
 
-            // 非 2xx：读一下响应体，用来区分「CDN 拦截」与「普通错误状态」。
-            let body = response.text().await.unwrap_or_default();
-            let error = classify_http_error(code, forbid_header.as_deref(), &body, url);
+            // 非 2xx：与成功路径一样有界读取，只是上限更小。已经读到的前缀仍然会被
+            // 用来提取 `Forbid_code`，所以 Forbid_code 落在前 32 KiB 里的情况不受影响。
+            let read = read_body_capped(&mut response, MAX_ERROR_BODY_BYTES).await;
+            let body = decode_body(&read.bytes, content_type.as_deref());
+            let error = match read.failure {
+                // 响应体完整：按既有规则分类。
+                None => classify_http_error(code, forbid_header.as_deref(), &body, url),
+                // 响应体超限 / 提前断开：已经读到的前缀仍然要参与分类（`Forbid_code`
+                // 常常就在前几百字节里），响应头给出的 Forbid_code 同样可信。两者都没有
+                // 命中时，不能假装「响应体就是空的」—— 那会把结论误导成普通状态码错误。
+                Some(failure) => {
+                    match classify_http_error(code, forbid_header.as_deref(), &body, url) {
+                        blocked @ WeatherError::Blocked { .. } => blocked,
+                        _ => WeatherError::UnreadableErrorBody {
+                            status: code,
+                            url: url.to_string(),
+                            reason: failure.to_string(),
+                        },
+                    }
+                }
+            };
             warn!(url, status = code, attempt, error = %error, "上游返回非 2xx");
             let retryable = error.is_retryable();
             last_error = Some(error);
@@ -159,23 +267,14 @@ impl HttpClient {
             WeatherError::Upstream(format!("请求上游失败且未取得任何响应：{url}"))
         }))
     }
+}
 
-    /// 等待到允许访问该主机的时刻，并预占下一个时间片。
-    async fn wait_for_slot(&self, host: &str) {
-        let now = Instant::now();
-        let wait = {
-            let Ok(mut guard) = self.throttle.lock() else {
-                return;
-            };
-            let next = guard.get(host).copied().unwrap_or(now);
-            let slot = if next > now { next } else { now };
-            guard.insert(host.to_string(), slot + self.min_interval);
-            slot.saturating_duration_since(now)
-        };
-        if !wait.is_zero() {
-            tokio::time::sleep(wait).await;
-        }
-    }
+fn header_value(response: &reqwest::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
 }
 
 fn host_of(url: &str) -> String {
@@ -185,21 +284,93 @@ fn host_of(url: &str) -> String {
     host.split(':').next().unwrap_or(host).to_string()
 }
 
-/// 分块读取响应体，超过 [`MAX_BODY_BYTES`] 就立刻放弃。
+/// 有界读取的结果。
 ///
-/// 不用 `response.bytes()`：那会把整个响应体一次性读进内存，没有上限。
-async fn read_body_limited(response: &mut reqwest::Response, url: &str) -> Result<Vec<u8>> {
+/// 读取失败时保留已经读到的前缀：错误页面里可能就藏着 `Forbid_code`，直接丢掉前缀
+/// 会让诊断更难定位。
+struct BodyRead {
+    bytes: Vec<u8>,
+    /// 读取过程中的异常（超限、提前断开）。`None` 表示响应体已完整读完。
+    failure: Option<BodyFailure>,
+}
+
+impl BodyRead {
+    /// 成功路径：要求响应体完整，否则转成具体错误。
+    fn into_ok(self, url: &str) -> Result<Vec<u8>> {
+        match self.failure {
+            None => Ok(self.bytes),
+            Some(failure) => Err(failure.into_error(url)),
+        }
+    }
+}
+
+/// 响应体读取过程中的异常。
+enum BodyFailure {
+    /// 超过上限。
+    TooLarge { limit: usize, at_least: usize },
+    /// 底层读取失败（连接提前断开、解码错误等）。
+    Transport(WeatherError),
+}
+
+impl BodyFailure {
+    fn into_error(self, url: &str) -> WeatherError {
+        match self {
+            Self::TooLarge { limit, at_least } => WeatherError::Parse(format!(
+                "上游响应体超过 {limit} 字节上限（至少 {at_least} 字节）：{url}"
+            )),
+            Self::Transport(err) => err,
+        }
+    }
+}
+
+impl std::fmt::Display for BodyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooLarge { limit, .. } => write!(f, "响应体超过 {limit} 字节读取上限"),
+            Self::Transport(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// 分块读取响应体，最多 `limit` 字节。
+///
+/// 不用 `response.text()` / `response.bytes()`：那会把整个响应体一次性读进内存，
+/// 没有上限，一个异常的 403/429/5xx 页面就能把内存拖垮。
+///
+/// 预分配只取 8 KiB 而不是 `limit`：正常页面（3 KB ~ 67 KB）远小于上限，
+/// 按上限预留会让每个请求都白占几 MiB 虚拟内存。
+async fn read_body_capped(response: &mut reqwest::Response, limit: usize) -> BodyRead {
     let mut body: Vec<u8> = Vec::with_capacity(8 * 1024);
     loop {
         match response.chunk().await {
             Ok(Some(chunk)) => {
-                if body.len() + chunk.len() > MAX_BODY_BYTES {
-                    return Err(oversized_body(url, body.len() + chunk.len()));
+                let total = body.len() + chunk.len();
+                if total > limit {
+                    // 只保留上限内的前缀，供调用方继续提取 `Forbid_code`。
+                    let keep = limit.saturating_sub(body.len()).min(chunk.len());
+                    body.extend_from_slice(&chunk[..keep]);
+                    return BodyRead {
+                        bytes: body,
+                        failure: Some(BodyFailure::TooLarge {
+                            limit,
+                            at_least: total,
+                        }),
+                    };
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(None) => return Ok(body),
-            Err(err) => return Err(WeatherError::from(err)),
+            Ok(None) => {
+                return BodyRead {
+                    bytes: body,
+                    failure: None,
+                };
+            }
+            Err(err) => {
+                return BodyRead {
+                    bytes: body,
+                    failure: Some(BodyFailure::Transport(WeatherError::from(err))),
+                };
+            }
         }
     }
 }
@@ -506,6 +677,84 @@ mod tests {
         assert_eq!(err.code(), "parse_error", "超限属于响应内容不可用：{err}");
         assert!(err.to_string().contains("字节上限"), "{err}");
         assert!(!err.is_retryable(), "超限重试没有意义");
+
+        server.await.expect("服务端任务不应 panic");
+    }
+
+    /// 同主机的第二个请求必须等到第一个的最小间隔之后才能进入发送区。
+    #[tokio::test]
+    async fn host_limiter_serializes_the_same_host() {
+        let limiter = HostLimiter::new(Duration::from_millis(120));
+        let mut first = limiter.enter("a.example").await;
+        first.anchor();
+        drop(first);
+
+        let started = Instant::now();
+        let mut second = limiter.enter("a.example").await;
+        let waited = started.elapsed();
+        second.anchor();
+
+        assert!(
+            waited >= Duration::from_millis(100),
+            "同主机的第二个请求必须等到最小间隔之后，实际只等了 {waited:?}"
+        );
+    }
+
+    /// 不同主机互不排队：限速是「每主机」的，不是全局串行。
+    #[tokio::test]
+    async fn host_limiter_schedules_hosts_independently() {
+        let limiter = HostLimiter::new(Duration::from_millis(200));
+        let started = Instant::now();
+        let (_a, _b) = tokio::join!(limiter.enter("a.example"), limiter.enter("b.example"));
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "不同主机不应互相排队，实际耗时 {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 上限裁剪只能保留前缀，不能把整块 chunk 都塞进去。
+    #[tokio::test]
+    async fn read_body_capped_keeps_only_the_prefix() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听本地端口");
+        let addr = listener.local_addr().expect("本地地址");
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("接受连接");
+            let mut scratch = [0u8; 2048];
+            let _ = socket.read(&mut scratch).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n")
+                .await;
+            // 故意用一个大 chunk 越过上限。
+            let _ = socket.write_all(&vec![b'x'; 64 * 1024]).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let config = Config {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let client = HttpClient::new(&config).expect("构建客户端");
+        let url = format!("http://{addr}/prefix");
+
+        // 直接复用成功路径的 4 MiB 上限不方便，这里用错误路径的 32 KiB 上限验证前缀语义。
+        let mut response = client
+            .client
+            .get(&url)
+            .send()
+            .await
+            .expect("本地服务应可访问");
+        let read = read_body_capped(&mut response, 1024).await;
+        assert_eq!(read.bytes.len(), 1024, "只保留上限内的前缀");
+        assert!(
+            matches!(read.failure, Some(BodyFailure::TooLarge { limit, .. }) if limit == 1024),
+            "超限必须被记录"
+        );
 
         server.await.expect("服务端任务不应 panic");
     }

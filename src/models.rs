@@ -295,18 +295,25 @@ pub struct ForecastBundle {
 
 /// 逐 3 小时预报结果集合。
 ///
-/// # `covered_hours` 的确切语义
+/// # `covered_hours` / `contiguous_hours` 的确切语义
 ///
-/// MCP 工具返回前会按 `reference_time`（本次调用的「现在」）裁剪时间窗，
-/// `covered_hours` 表示**从现在起、被返回的时点真正覆盖到的小时数**：
+/// 每个时点 `t` 代表半开区间 `[t, t + resolution_hours)`。MCP 工具返回前会按
+/// `reference_time`（本次调用的「现在」）把数据裁剪到 `[reference_time,
+/// reference_time + requested_hours)`，两个字段都是「请求窗口」与「数据区间并集」的
+/// 真实交集长度（详见 [`crate::window`]）：
 ///
 /// ```text
-/// coverage_end  = min(最后一个时点 + 3 小时, reference_time + requested_hours)
-/// covered_hours = floor((coverage_end - reference_time) / 1 小时)
+/// covered_hours    = floor( 窗口内所有交集区间长度之和 / 1 小时 )   // 累计，允许中间有缺口
+/// contiguous_hours = floor( 从 reference_time 起连续不断的交集长度 / 1 小时 )
 /// ```
 ///
-/// 因此它永远不会大于 `requested_hours`，也不会大于上游实际给出的数据跨度；
-/// 上游只覆盖了一部分窗口时，这里如实给出较小的数字，不做任何「至少 3 小时」的兜底。
+/// 因此两者都**不可能被夸大**：既不会大于 `requested_hours`，也不会大于上游实际给出
+/// 的数据跨度。上游只覆盖了一部分窗口、或者中间有缺口时，这里如实给出较小的数字，
+/// 不做任何「至少 3 小时」的兜底，也不插值。
+///
+/// 未按时间窗裁剪的原始抓取结果（例如 [`crate::providers`] 直接返回的 bundle）里
+/// `requested_hours = 0`、`reference_time` / `coverage_end` / `contiguous_hours`
+/// 都不存在，`covered_hours` 表示上游数据本身的总跨度。
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HourlyBundle {
     /// 城市信息。
@@ -321,12 +328,18 @@ pub struct HourlyBundle {
     pub resolution_hours: u32,
     /// 请求的小时数。
     pub requested_hours: u32,
-    /// 从现在起实际被覆盖的小时数（见上方语义说明）。
+    /// 窗口内累计被数据覆盖的小时数（允许中间有缺口，见上方语义说明）。
     pub covered_hours: u32,
+    /// 从 `reference_time` 起连续被覆盖的小时数（遇到第一个缺口即止）。
+    ///
+    /// `covered_hours` 相同但 `contiguous_hours` 更小，说明窗口里有数据缺口 ——
+    /// 调用方不能用后面的数据回答「接下来连续 N 小时怎么样」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contiguous_hours: Option<u32>,
     /// 裁剪时间窗所用的「现在」（UTC+8）。由 MCP 工具写入，便于调用方复核窗口。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reference_time: Option<DateTime<FixedOffset>>,
-    /// 最后一个返回时点所在 3 小时区间的结束时刻，且不超过请求的截止时刻。
+    /// 最后一段真实覆盖区间的结束时刻，且不超过请求的截止时刻。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub coverage_end: Option<DateTime<FixedOffset>>,
     /// 逐时点预报。

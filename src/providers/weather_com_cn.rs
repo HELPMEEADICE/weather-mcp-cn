@@ -560,7 +560,8 @@ impl HourlyPayload {
     /// 这里**不裁剪时间窗**，也不编造 `requested_hours` / `covered_hours`：
     /// 窗口与覆盖时长是「请求」的属性，由 MCP 工具用真实当前时间计算
     /// （见 [`crate::window`]）。本函数给出的 `covered_hours` 只是「上游数据本身
-    /// 的总跨度」，方便调用方了解数据量。
+    /// 的总跨度」，方便调用方了解数据量；`contiguous_hours` 与 `coverage_end`
+    /// 只有在按窗口裁剪之后才有意义，因此这里是 `None`。
     pub fn into_bundle(
         self,
         city: CityInfo,
@@ -581,6 +582,7 @@ impl HourlyPayload {
             resolution_hours: RESOLUTION_HOURS as u32,
             requested_hours: 0,
             covered_hours,
+            contiguous_hours: None,
             reference_time: None,
             coverage_end: None,
             hours: self.points,

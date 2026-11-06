@@ -74,6 +74,18 @@ pub enum WeatherError {
     #[error("中国天气网返回 HTTP {status}（{url}）")]
     UpstreamStatus { status: u16, url: String },
 
+    /// 上游返回了非预期状态码，且响应体没能完整读取（超出上限或连接提前断开）。
+    ///
+    /// 和 [`WeatherError::UpstreamStatus`] 共用同一个机器可读错误码，区别只在诊断：
+    /// 状态码已经拿到，但错误页不可读，因此无法再区分「普通错误页」与「CDN 拦截页」。
+    /// 绝不能把它悄悄当成「响应体是空的」—— 那会得到一句没有依据的状态码错误。
+    #[error("中国天气网返回 HTTP {status}（{url}），但错误响应体未能完整读取：{reason}")]
+    UnreadableErrorBody {
+        status: u16,
+        url: String,
+        reason: String,
+    },
+
     /// 被上游 CDN / WAF 拦截。
     ///
     /// 与中国天气网实测确认的两个触发条件：`Referer` 缺失或不是
@@ -110,7 +122,9 @@ impl WeatherError {
             Self::Unsupported(_) => "unsupported_data",
             Self::ForecastWindowUnavailable { .. } => "forecast_window_unavailable",
             Self::Upstream(_) => "upstream_unavailable",
-            Self::UpstreamStatus { .. } => "upstream_status",
+            // 响应体读不完整不改变「上游回了什么状态码」这个事实，因此错误码保持稳定，
+            // 客户端的既有分支逻辑不需要改。
+            Self::UpstreamStatus { .. } | Self::UnreadableErrorBody { .. } => "upstream_status",
             Self::Blocked { .. } => "upstream_blocked",
             Self::Timeout(_) => "timeout",
             Self::Parse(_) => "parse_error",
@@ -127,6 +141,7 @@ impl WeatherError {
             Self::Unsupported(_) | Self::ForecastWindowUnavailable { .. } => "unavailable",
             Self::Upstream(_)
             | Self::UpstreamStatus { .. }
+            | Self::UnreadableErrorBody { .. }
             | Self::Blocked { .. }
             | Self::Timeout(_) => "upstream",
             Self::Parse(_) => "upstream_format",
@@ -147,6 +162,9 @@ impl WeatherError {
                 "缩小 hours 后重试，或改用 get_weather_forecast 查询逐日预报"
             }
             Self::UpstreamStatus { .. } => "稍后重试；若持续 404 请确认城市代码是否真的存在",
+            Self::UnreadableErrorBody { .. } => {
+                "稍后重试；若持续出现说明上游错误页异常（体积过大或连接被中断）"
+            }
             Self::Blocked { .. } => "检查出口代理是否改写了请求头；本项目默认请求头实测可用",
             Self::Timeout(_) | Self::Upstream(_) => "稍后重试，上游抖动通常几秒内自行恢复",
             Self::Parse(_) => "上游结构可能已变化，属服务端问题，请附 source.url 反馈，不建议重试",
@@ -173,7 +191,9 @@ impl WeatherError {
             // CDN 拦截既可能是请求头永久不合规，也可能是短时风控，
             // 重试一两次成本很低，能救回后者。
             Self::Blocked { .. } => true,
-            Self::UpstreamStatus { status, .. } => *status == 429 || *status >= 500,
+            Self::UpstreamStatus { status, .. } | Self::UnreadableErrorBody { status, .. } => {
+                *status == 429 || *status >= 500
+            }
             // 页面改版、城市不存在、窗口无数据都不该重试。
             _ => false,
         }
@@ -212,6 +232,15 @@ impl WeatherError {
             Self::UpstreamStatus { status, url } => {
                 data.insert("status".into(), json!(status));
                 data.insert("url".into(), json!(url));
+            }
+            Self::UnreadableErrorBody {
+                status,
+                url,
+                reason,
+            } => {
+                data.insert("status".into(), json!(status));
+                data.insert("url".into(), json!(url));
+                data.insert("reason".into(), json!(reason));
             }
             Self::Blocked {
                 status, code, url, ..

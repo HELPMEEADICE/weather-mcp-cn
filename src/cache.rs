@@ -25,6 +25,21 @@
 //!   等待者会重新回查缓存或自己成为新的 leader，因此不会死锁；
 //! * 只有 `Ok` 结果会写进缓存，失败结果不缓存 —— 一次网络抖动不会被固化成一整段
 //!   时间内的错误。
+//!
+//! # 为什么「拿到领导权」之后还要回查缓存
+//!
+//! 首次 `get` 与 `join` 之间存在一段窗口：请求 A 检查到未命中，还没注册 flight 时
+//! 被调度走了；请求 B 在这个间隙里完成加载、写入缓存并注销 flight；A 恢复后
+//! `join` 成功、成为新的 leader。如果 A 不回查缓存，同一份数据会被打两次上游。
+//! 现在 leader 在真正加载前一定会再回查一次缓存（见 [`TtlCache::get_or_try_insert_with`]），
+//! 而且这个回查是**充分**的：leader 一定先 `insert` 再注销 flight，所以能拿到领导权
+//! 就说明此前所有 leader 都已经写完。
+//!
+//! # 极端情况下的加载放大是有上界的
+//!
+//! 协作轮次用尽后会退化成「自己直接加载」。这条路径只会被 `MAX_COOPERATIVE_ATTEMPTS`
+//! 次连续失败 / 取消触发，并且每个调用者最多执行一次，因此 N 个并发调用者的总加载
+//! 次数不超过 `N + MAX_COOPERATIVE_ATTEMPTS` —— 与调用数同阶，不会指数放大。
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -33,6 +48,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
+use tracing::warn;
 
 /// 等待 leader 结束（并回查缓存）的最大轮次。
 ///
@@ -85,13 +101,16 @@ where
     /// 把槽位挂到表头（最近使用）。
     fn push_front(&mut self, idx: usize) {
         let old_head = self.head;
-        if let Some(node) = self.nodes[idx].as_mut() {
+        if let Some(node) = self.nodes.get_mut(idx).and_then(Option::as_mut) {
             node.prev = None;
             node.next = old_head;
+        } else {
+            // 槽位不存在（只可能来自被破坏的内部状态）：不要下标的越界访问。
+            return;
         }
         match old_head {
             Some(head) => {
-                if let Some(node) = self.nodes[head].as_mut() {
+                if let Some(node) = self.nodes.get_mut(head).and_then(Option::as_mut) {
                     node.prev = Some(idx);
                 }
             }
@@ -102,12 +121,17 @@ where
 
     /// 从链表里摘掉槽位，但保留槽位内容。
     fn unlink(&mut self, idx: usize) {
-        let Some((prev, next)) = self.nodes[idx].as_ref().map(|node| (node.prev, node.next)) else {
+        let Some((prev, next)) = self
+            .nodes
+            .get(idx)
+            .and_then(Option::as_ref)
+            .map(|node| (node.prev, node.next))
+        else {
             return;
         };
         match prev {
             Some(prev) => {
-                if let Some(node) = self.nodes[prev].as_mut() {
+                if let Some(node) = self.nodes.get_mut(prev).and_then(Option::as_mut) {
                     node.next = next;
                 }
             }
@@ -115,13 +139,13 @@ where
         }
         match next {
             Some(next) => {
-                if let Some(node) = self.nodes[next].as_mut() {
+                if let Some(node) = self.nodes.get_mut(next).and_then(Option::as_mut) {
                     node.prev = prev;
                 }
             }
             None => self.tail = prev,
         }
-        if let Some(node) = self.nodes[idx].as_mut() {
+        if let Some(node) = self.nodes.get_mut(idx).and_then(Option::as_mut) {
             node.prev = None;
             node.next = None;
         }
@@ -189,8 +213,10 @@ where
         // 槽位下标在生命周期内保持稳定（`nodes` 只增长、槽位只换内容），
         // 因此可以在遍历过程中安全删除当前下标对应的槽位。
         for idx in 0..self.nodes.len() {
-            let expired = self.nodes[idx]
-                .as_ref()
+            let expired = self
+                .nodes
+                .get(idx)
+                .and_then(Option::as_ref)
                 .is_some_and(|node| node.expires_at <= now);
             if expired && self.remove(idx).is_some() {
                 removed += 1;
@@ -233,7 +259,11 @@ where
         while let Some(idx) = cursor {
             back += 1;
             assert!(back <= self.len + 1, "反向链表出现环");
-            cursor = self.nodes[idx].as_ref().and_then(|node| node.prev);
+            cursor = self
+                .nodes
+                .get(idx)
+                .and_then(Option::as_ref)
+                .and_then(|node| node.prev);
         }
         assert_eq!(back, seen, "反向遍历长度与正向不一致");
 
@@ -326,6 +356,27 @@ where
         self.ttl
     }
 
+    /// 取内部状态锁；锁中毒时把状态重置为空表。
+    ///
+    /// 「索引 ↔ 双向链表 ↔ 槽位」是一个**整体**不变量：如果 panic 发生在两次指针改写
+    /// 之间，链表可能已经残缺（head 悬空、成环、`len` 与实际不符）。继续复用这份数据
+    /// 会让后续操作读到不一致的结构，所以这里直接丢掉重来 —— 缓存是纯派生数据，
+    /// 丢弃永远是安全的选择，而带着损坏的链表继续跑不是。
+    fn lock_inner(&self) -> MutexGuard<'_, Inner<K, V>> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = Inner::default();
+                // 必须清掉中毒标记：否则这一把锁此后每次都会走「中毒」分支，
+                // 缓存会被反复重置成空表，等于永久失效。
+                self.inner.clear_poison();
+                warn!("缓存内部链表在持锁期间发生过 panic，已重置为空表以免带着损坏状态继续运行");
+                guard
+            }
+        }
+    }
+
     /// 容量上限。
     pub fn capacity(&self) -> usize {
         self.capacity
@@ -336,16 +387,22 @@ where
     /// 顺带把当前这个键的过期条目删掉，避免死数据长期占着容量。
     pub fn get(&self, key: &K) -> Option<V> {
         let now = Instant::now();
-        let mut inner = lock(&self.inner);
+        let mut inner = self.lock_inner();
         let idx = *inner.index.get(key)?;
-        let alive = inner.nodes[idx]
-            .as_ref()
+        let alive = inner
+            .nodes
+            .get(idx)
+            .and_then(Option::as_ref)
             .is_some_and(|node| node.expires_at > now);
         if !alive {
             inner.remove(idx);
             return None;
         }
-        let value = inner.nodes[idx].as_ref().map(|node| node.value.clone())?;
+        let value = inner
+            .nodes
+            .get(idx)
+            .and_then(Option::as_ref)
+            .map(|node| node.value.clone())?;
         inner.touch(idx);
         Some(value)
     }
@@ -362,7 +419,7 @@ where
     pub fn insert_with_ttl(&self, key: K, value: V, ttl: Duration) {
         let now = Instant::now();
         let expires_at = now + ttl;
-        let mut inner = lock(&self.inner);
+        let mut inner = self.lock_inner();
 
         // 只有写满容量时才需要付出 O(n)：先清掉已经过期的死条目，
         // 这样「有数据过期」的情况下不会误伤仍然有效的条目。
@@ -371,7 +428,7 @@ where
         }
 
         if let Some(&idx) = inner.index.get(&key) {
-            if let Some(node) = inner.nodes[idx].as_mut() {
+            if let Some(node) = inner.nodes.get_mut(idx).and_then(Option::as_mut) {
                 node.value = value;
                 node.expires_at = expires_at;
             }
@@ -414,6 +471,19 @@ where
                     key: key.clone(),
                     flight: Arc::clone(&flight),
                 };
+
+                // 二次回查：从上面那次 `get` 到 `join` 之间有一小段窗口，另一个 leader
+                // 可能刚好完成加载、写进缓存并注销 flight，于是我们会成为新的 leader。
+                // 不回查就会把同一份数据再打一次上游。
+                //
+                // 这个回查是充分的：leader 一定先 `insert` 再注销 flight，所以「拿到
+                // 领导权」意味着所有更早的 leader 要么已经写完缓存（我们必然读到），
+                // 要么 flight 还在表里（我们就拿不到领导权）。
+                if let Some(hit) = self.get(&key) {
+                    drop(guard);
+                    return Ok(hit);
+                }
+
                 let load = pending.take().expect("只有 leader 会消耗加载闭包");
                 let outcome = load().await;
                 if let Ok(value) = &outcome {
@@ -427,9 +497,20 @@ where
             let _ = flight.wait().await;
         }
 
-        // 极端情况下的兜底：不再协作，自己打一次上游。
+        // 极端兜底：leader 连续被取消 / 反复失败，协作轮次用尽。
+        //
+        // 这条路径每个调用者最多走一次，所以 N 个并发调用者的总加载次数不超过
+        // `N + MAX_COOPERATIVE_ATTEMPTS`，与调用数同阶，不会指数放大。
+        if let Some(hit) = self.get(&key) {
+            return Ok(hit);
+        }
         let load = pending.take().expect("兜底分支最多执行一次");
-        load().await
+        let outcome = load().await;
+        // 兜底加载成功同样要写缓存，否则这次成功白白丢掉、下一个请求还要再打一次上游。
+        if let Ok(value) = &outcome {
+            self.insert(key, value.clone());
+        }
+        outcome
     }
 
     /// 加入已有 flight 或新建一个；返回 `(flight, 是否成为 leader)`。
@@ -463,7 +544,7 @@ where
     /// 当前有效条目数量（顺带清理过期条目）。
     pub fn len(&self) -> usize {
         let now = Instant::now();
-        let mut inner = lock(&self.inner);
+        let mut inner = self.lock_inner();
         inner.sweep_expired(now);
         inner.len
     }
@@ -475,7 +556,7 @@ where
 
     /// 清空缓存内容（不打断正在进行的 singleflight）。
     pub fn clear(&self) {
-        let mut inner = lock(&self.inner);
+        let mut inner = self.lock_inner();
         *inner = Inner::default();
     }
 
@@ -507,7 +588,7 @@ mod tests {
 
     /// 断言缓存的内部结构（索引、双向链表、槽位）自洽。
     fn assert_consistent<K: Eq + Hash + Clone, V: Clone>(cache: &TtlCache<K, V>) {
-        lock(&cache.inner).assert_consistent();
+        cache.lock_inner().assert_consistent();
     }
 
     #[test]
@@ -640,6 +721,29 @@ mod tests {
         cache.insert(2, 2);
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.get(&2), Some(2));
+    }
+
+    /// 持锁期间 panic 之后不得沿用可能残缺的链表：应当重置为空表并继续可用。
+    #[test]
+    fn poisoned_inner_state_is_reset_instead_of_reused() {
+        let cache: TtlCache<u32, u32> = cache(Duration::from_secs(60), 4);
+        cache.insert(1, 10);
+        cache.insert(2, 20);
+        assert_eq!(cache.len(), 2);
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.inner.lock().expect("首次取锁不应中毒");
+            panic!("模拟持锁期间 panic，链表状态可能只改了一半");
+        }));
+        assert!(panicked.is_err(), "预期会捕获到 panic");
+
+        // 中毒恢复的正确姿势是丢弃，而不是继续使用可能损坏的 head/tail/index。
+        assert_eq!(cache.len(), 0, "中毒后必须重置为空表");
+        assert_consistent(&cache);
+
+        cache.insert(3, 30);
+        assert_eq!(cache.get(&3), Some(30));
+        assert_consistent(&cache);
     }
 
     #[tokio::test]

@@ -115,7 +115,7 @@ try {
     $hr = Show-Tool "get_hourly_weather" @{ city = "北京"; hours = 12 } "北京逐3小时"
     if ($hr) {
         Write-Host ("  粒度: " + $hr.resolution_hours + " 小时; 时点数: " + $hr.hours.Count)
-        Write-Host ("  请求 " + $hr.requested_hours + " 小时, 实际覆盖 " + $hr.covered_hours + " 小时 (截至 " + $hr.coverage_end + ", 基准 " + $hr.reference_time + ")")
+        Write-Host ("  请求 " + $hr.requested_hours + " 小时, 累计覆盖 " + $hr.covered_hours + " 小时, 连续覆盖 " + $hr.contiguous_hours + " 小时 (截至 " + $hr.coverage_end + ", 基准 " + $hr.reference_time + ")")
         foreach ($h in $hr.hours) { Write-Host ("  " + $h.time + "  " + $h.weather + " " + $h.temperature_c + "°C " + $h.wind_direction + $h.wind_scale) }
     }
 
