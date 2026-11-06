@@ -19,16 +19,38 @@
 //! 1. 先进入**主机独占区**（[`HostLimiter::enter`]）：同一主机同一时刻只有一个请求
 //!    在这里排队等自己的时间片 —— 限速等待期间不占用任何并发许可；
 //! 2. 再申请全局并发许可：许可证只在真正要发请求时才持有；
-//! 3. 拿到许可、真正发送之前调用 [`HostLease::anchor`]，把「下一次最早发送时刻」锚定在
-//!    `Instant::now()`，因此记录的是**真实发送时刻**而不是预约时刻；
+//! 3. 请求对象先构造完，最后才调用 [`HostLease::anchor`] 把「下一次最早发送时刻」
+//!    锚定到 `Instant::now()`，紧接着 `send().await`；
 //! 4. 锚定后立刻释放主机独占区，让同主机的下一个请求开始等它自己的时刻，而本次请求
 //!    继续带着并发许可读响应体。
 //!
 //! 不同主机的独占区互不相关，可以并行推进。
 //!
+//! # 时间锚定的保证范围（不要夸大）
+//!
+//! `anchor()` 与 `request.send()` 的首次 poll 之间**没有任何 `.await`**，因此
+//! Tokio 调度器没有插入点：单线程与多线程 Runtime 都无法把「另一个同主机请求」
+//! 塞进这段区间，锚定与请求交给 HTTP 客户端发生在同一个任务 poll 里。
+//!
+//! 剩下两段偏差不在本层可控范围内，测试里用本地回环实测过它们的量级：
+//!
+//! * **操作系统抢占**：线程可能在 `anchor()` 之后的任意指令处被抢占，这段只受
+//!   OS 调度影响（微秒级，极端负载下可能到毫秒级）；
+//! * **连接建立**：`send()` 的后续 poll 还要走 DNS / TCP / TLS，真正写到 socket
+//!   的时刻可能比锚定晚一个连接建立的往返。
+//!
+//! 所以本层保证的是「**派发锚点**之间的间隔不小于 `min_request_interval`」，
+//! 而不是「socket 写出的绝对时刻」。两条实际含义：
+//!
+//! * 同主机连续请求的锚点间隔（因此也是服务端观测到的到达间隔）不会小于最小间隔；
+//! * 冷连接或极端 OS 抢占下，真实到达可能比上一个请求的锚点再晚一点 —— 只会
+//!   **更分散**，不会更密集。
+//!
 //! 本项目不做任何访问控制规避：不换代理池、不伪造验证码、不并发轰炸单一站点。
 
 use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -126,6 +148,12 @@ pub struct HttpClient {
     semaphore: Semaphore,
     hosts: HostLimiter,
     max_retries: u32,
+    /// 每次 `anchor()` 的时刻（**仅测试构建存在**，生产二进制里没有这个字段）。
+    ///
+    /// 用来断言「记录的发送时刻」与「服务端观测到的到达时刻」之间的偏差量级，
+    /// 见 `anchor_time_matches_the_real_request_arrival`。
+    #[cfg(test)]
+    anchors: StdMutex<Vec<Instant>>,
 }
 
 impl HttpClient {
@@ -154,7 +182,15 @@ impl HttpClient {
             semaphore: Semaphore::new(config.max_concurrency.max(1)),
             hosts: HostLimiter::new(config.min_request_interval),
             max_retries: config.max_retries,
+            #[cfg(test)]
+            anchors: StdMutex::new(Vec::new()),
         })
+    }
+
+    /// 取出到目前为止记录的所有锚定时刻（仅测试构建存在）。
+    #[cfg(test)]
+    fn anchors(&self) -> Vec<Instant> {
+        lock(&self.anchors).clone()
     }
 
     /// GET 一个上游地址，返回解码后的文本。
@@ -174,20 +210,27 @@ impl HttpClient {
 
             // 1) 先在主机独占区里等到允许发送的时刻（不占并发许可）。
             let mut lease = self.hosts.enter(&host).await;
-            // 2) 再申请全局并发许可。
+            // 2) 再申请全局并发许可：许可只在真正要发请求时才持有。
             let _permit = self
                 .semaphore
                 .acquire()
                 .await
                 .map_err(|_| WeatherError::Upstream("HTTP 并发控制已关闭".to_string()))?;
-            // 3) 真正发送之前锚定时刻，然后让出主机独占区。
-            lease.anchor();
-            drop(lease);
 
             let mut request = self.client.get(url).header("Accept", "*/*");
             if let Some(referer) = referer {
                 request = request.header("Referer", referer);
             }
+
+            // 3) 请求已经构造完毕，最后才锚定时刻 —— 与 `send()` 之间**不允许**出现
+            //    任何 `.await`：锚点和「把请求交给 HTTP 客户端」落在同一个任务 poll 里，
+            //    Tokio 调度器没有插入点（详见模块文档的「时间锚定的保证范围」）。
+            lease.anchor();
+            #[cfg(test)]
+            lock(&self.anchors).push(Instant::now());
+            // 4) 锚定后立刻让出主机独占区：同主机的下一个请求开始等它自己的时刻，
+            //    本次请求继续带着并发许可读响应体（不在独占区里做网络 IO）。
+            drop(lease);
 
             let mut response = match request.send().await {
                 Ok(response) => response,
@@ -757,5 +800,291 @@ mod tests {
         );
 
         server.await.expect("服务端任务不应 panic");
+    }
+
+    // -----------------------------------------------------------------------
+    // 时间锚定：记录出来的发送时刻究竟离真实发送有多远
+    // -----------------------------------------------------------------------
+
+    /// 本地回环服务器：记录每个请求头**真正到达**的时刻，并依次回放 `statuses`。
+    async fn arrival_server(
+        statuses: Vec<&'static str>,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<Instant>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听本地端口");
+        let addr = listener.local_addr().expect("本地地址");
+        let arrivals = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = std::sync::Arc::clone(&arrivals);
+
+        tokio::spawn(async move {
+            for status in statuses {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut scratch = [0u8; 2048];
+                let mut head = Vec::new();
+                loop {
+                    match socket.read(&mut scratch).await {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            head.extend_from_slice(&scratch[..read]);
+                            if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => return,
+                    }
+                }
+                // 请求头到齐 = 客户端真正把请求发出来了。
+                lock(&recorder).push(Instant::now());
+
+                let body = "ok";
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        (format!("http://{addr}/probe"), arrivals)
+    }
+
+    /// 锚点必须贴近真实发送时刻。
+    ///
+    /// 这是「记录的发送时间 vs 实际发送时间」这个时序窗口里**唯一可观测**的部分：
+    /// 服务端收到请求头的时刻减去客户端记录的锚点，就是锚点相对真实发送的全部偏差。
+    /// `anchor()` 与 `send()` 之间没有 `.await`，所以这段偏差只剩 OS 抢占与连接建立，
+    /// 在本地回环上应当是个位数的毫秒。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anchor_time_matches_the_real_request_arrival() {
+        let (url, arrivals) = arrival_server(vec!["200 OK"]).await;
+        let config = Config {
+            max_retries: 0,
+            min_request_interval: Duration::ZERO,
+            ..Default::default()
+        };
+        let client = HttpClient::new(&config).expect("构建客户端");
+
+        assert_eq!(client.get_text(&url, None).await.expect("应成功"), "ok");
+
+        let anchors = client.anchors();
+        assert_eq!(anchors.len(), 1, "一次请求只锚定一次");
+        let arrival = lock(&arrivals)
+            .first()
+            .copied()
+            .expect("服务端应记录到达时刻");
+
+        assert!(arrival >= anchors[0], "锚定时刻必须早于真实到达");
+        let skew = arrival.duration_since(anchors[0]);
+        assert!(
+            skew <= Duration::from_millis(100),
+            "锚点与真实发送时刻的偏差过大：{skew:?}"
+        );
+    }
+
+    /// 同主机连续请求：锚点间隔与服务端观测到的到达间隔都必须满足最小间隔。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn consecutive_anchors_obey_the_min_interval() {
+        const MIN_INTERVAL: Duration = Duration::from_millis(60);
+        let (url, arrivals) = arrival_server(vec!["200 OK", "200 OK", "200 OK"]).await;
+        let config = Config {
+            max_retries: 0,
+            min_request_interval: MIN_INTERVAL,
+            ..Default::default()
+        };
+        let client = HttpClient::new(&config).expect("构建客户端");
+
+        for _ in 0..3 {
+            client.get_text(&url, None).await.expect("应成功");
+        }
+
+        let anchors = client.anchors();
+        assert_eq!(anchors.len(), 3);
+        for pair in anchors.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap + Duration::from_millis(2) >= MIN_INTERVAL,
+                "锚点间隔必须不小于最小间隔，实际 {gap:?}"
+            );
+        }
+
+        let arrivals = lock(&arrivals).clone();
+        assert_eq!(arrivals.len(), 3);
+        for pair in arrivals.windows(2) {
+            let gap = pair[1] - pair[0];
+            // 容差只覆盖回环与计时器精度，不放宽到「接近 0」的量级。
+            assert!(
+                gap + Duration::from_millis(20) >= MIN_INTERVAL,
+                "服务端观测到的到达间隔必须满足最小间隔，实际 {gap:?}"
+            );
+        }
+    }
+
+    /// 重试也必须重新排队等限速，不能沿用上一次的锚点直接重发。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retries_re_enter_the_host_gate() {
+        // 第一次重试前的退避是 600~799ms，把最小间隔设到 900ms 才能区分
+        // 「限速真的生效」与「只是退避刚好够久」。
+        const MIN_INTERVAL: Duration = Duration::from_millis(900);
+        let (url, arrivals) = arrival_server(vec!["503 Service Unavailable", "200 OK"]).await;
+        let config = Config {
+            max_retries: 1,
+            min_request_interval: MIN_INTERVAL,
+            ..Default::default()
+        };
+        let client = HttpClient::new(&config).expect("构建客户端");
+
+        assert_eq!(
+            client.get_text(&url, None).await.expect("重试后应成功"),
+            "ok"
+        );
+
+        let anchors = client.anchors();
+        assert_eq!(anchors.len(), 2, "重试也要重新锚定一次");
+        let gap = anchors[1] - anchors[0];
+        assert!(
+            gap + Duration::from_millis(2) >= MIN_INTERVAL,
+            "重试必须重新等限速，实际锚点间隔 {gap:?}"
+        );
+
+        let arrivals = lock(&arrivals).clone();
+        assert_eq!(arrivals.len(), 2);
+        let wire_gap = arrivals[1] - arrivals[0];
+        assert!(
+            wire_gap + Duration::from_millis(20) >= MIN_INTERVAL,
+            "重试的真实到达间隔也要满足最小间隔，实际 {wire_gap:?}"
+        );
+    }
+
+    /// 排队中被取消的请求不能把主机闸门卡死，也不能留下过期状态。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_a_throttled_request_does_not_wedge_the_host_gate() {
+        const MIN_INTERVAL: Duration = Duration::from_millis(150);
+        let (url, _arrivals) = arrival_server(vec!["200 OK", "200 OK"]).await;
+        let config = Config {
+            max_retries: 0,
+            min_request_interval: MIN_INTERVAL,
+            ..Default::default()
+        };
+        let client = HttpClient::new(&config).expect("构建客户端");
+
+        client.get_text(&url, None).await.expect("第一次应成功");
+
+        // 第二次请求会在主机闸门的 sleep 里被取消（10ms < 150ms）。
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(10), client.get_text(&url, None)).await;
+        assert!(cancelled.is_err(), "第二次请求应在限速等待中被取消");
+
+        // 第三次请求必须能正常完成 —— 闸门既没卡死，也没丢掉限速状态。
+        let third = tokio::time::timeout(Duration::from_secs(5), client.get_text(&url, None))
+            .await
+            .expect("取消之后主机闸门不能卡死")
+            .expect("第三次请求应成功");
+        assert_eq!(third, "ok");
+
+        let anchors = client.anchors();
+        assert_eq!(anchors.len(), 2, "被取消的请求不会锚定");
+        let gap = anchors[1] - anchors[0];
+        assert!(
+            gap + Duration::from_millis(2) >= MIN_INTERVAL,
+            "取消之后的请求仍然要满足最小间隔，实际 {gap:?}"
+        );
+    }
+
+    /// 第一条连接被服务端扣住（用于长期占满并发许可），后续连接立刻回 200。
+    async fn gated_server() -> (String, tokio::sync::oneshot::Sender<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听本地端口");
+        let addr = listener.local_addr().expect("本地地址");
+        let (release, hold) = tokio::sync::oneshot::channel();
+        let hold = std::sync::Arc::new(tokio::sync::Mutex::new(Some(hold)));
+
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let hold = std::sync::Arc::clone(&hold);
+                let is_first = first;
+                first = false;
+                tokio::spawn(async move {
+                    let mut scratch = [0u8; 2048];
+                    let _ = socket.read(&mut scratch).await;
+                    if is_first && let Some(hold) = hold.lock().await.take() {
+                        let _ = hold.await;
+                    }
+                    let body = "ok";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        (format!("http://{addr}/gated"), release)
+    }
+
+    /// 等许可时被取消，不能吞掉全局并发许可。
+    ///
+    /// `max_concurrency = 1` 时，第一个请求被服务端扣住、长期持有唯一的许可；
+    /// 第二个请求卡在 `semaphore.acquire()` 上被 abort。许可必须仍然可用，
+    /// 否则后续所有请求都会永久挂起。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_while_waiting_for_a_permit_does_not_leak_it() {
+        let (url, release) = gated_server().await;
+        let config = Config {
+            max_concurrency: 1,
+            max_retries: 0,
+            min_request_interval: Duration::ZERO,
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let client = std::sync::Arc::new(HttpClient::new(&config).expect("构建客户端"));
+
+        // 1) 第一个请求占住唯一的许可。
+        let holder = {
+            let client = std::sync::Arc::clone(&client);
+            let url = url.clone();
+            tokio::spawn(async move { client.get_text(&url, None).await })
+        };
+
+        // 2) 第二个请求排在许可队列里，30ms 后被取消。
+        let waiter = {
+            let client = std::sync::Arc::clone(&client);
+            let url = url.clone();
+            tokio::spawn(async move { client.get_text(&url, None).await })
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        waiter.abort();
+        let _ = waiter.await;
+
+        // 3) 放行第一个请求：它结束时会归还许可。
+        let _ = release.send(());
+        assert_eq!(
+            holder.await.expect("不应 panic").expect("应成功"),
+            "ok",
+            "被扣住的第一个请求在放行后必须成功"
+        );
+
+        // 4) 取消之后仍然能拿到许可 —— 泄漏的话这里会一直挂到超时。
+        let third = tokio::time::timeout(Duration::from_secs(5), client.get_text(&url, None))
+            .await
+            .expect("并发许可不得泄漏")
+            .expect("第三次请求应成功");
+        assert_eq!(third, "ok");
     }
 }

@@ -596,12 +596,43 @@ impl HourlyPayload {
 pub const HOURLY_GRANULARITY_NOTE: &str =
     "中国天气网公开数据为 3 小时粒度，本项目未做任何插值或推算；时间均为北京时间（UTC+8）";
 
+/// 逐 3 小时时点的存储上限（内存控制）。
+///
+/// 32 个时点 = 96 小时 = 4 天，远大于 MCP 层允许请求的 24 小时窗口，也覆盖了
+/// `1d` + `23d` 能给出的全部有效范围；再往后只会在缓存里白占内存。
+pub const MAX_HOURLY_POINTS: usize = 32;
+
+/// `hour3data` 里逐时数据的字段优先级：**越靠前越权威**。
+///
+/// 实测（2026-11）线上布局：
+///
+/// | 字段 | 覆盖范围 | 布局 | 说明 |
+/// | --- | --- | --- | --- |
+/// | `1d` | 未来 24 小时 | `["06日11时,...", …]` 8 个元素 | 刷新最频繁，第 1 天以它为准 |
+/// | `23d` | 第 2~3 天 | `[["07日08时,...", …], …]` | 第 2~3 天以它为准 |
+/// | `7d` | 未来 7 天 | `[["06日11时,...", …] × 7]` | 粒度最粗，只用来补齐前两者缺失的时点 |
+///
+/// 同一天的时点会同时出现在多个字段里，取值以优先级高者为准。
+pub const HOURLY_SOURCE_PRIORITY: [&str; 3] = ["1d", "23d", "7d"];
+
 /// 解析 1 日页面内联的 `hour3data`。
 pub fn parse_hourly_html(html: &str, city: CityInfo, url: String) -> Result<HourlyBundle> {
     Ok(parse_hourly_page(html)?.into_bundle(city, url, cst_now()))
 }
 
 /// 只解析页面内容，不绑定任何请求上下文。
+///
+/// # 为什么要合并 `1d` / `23d` / `7d`
+///
+/// `1d` 的 8 个时点只保证覆盖「从**首个预报时点**起的 24 小时」，并不保证覆盖
+/// 「从**用户调用时刻**起的 24 小时」。例如 2026-11-06 的北京页面：`1d` 从
+/// `06日11时` 到 `07日08时`（区间到 `07日11时`），而用户在 `06日14时` 请求未来
+/// 24 小时，截止时刻是 `07日14时` —— 此时 `23d` 里的 `07日11时`、`07日14时`
+/// 正是窗口缺的那一段。旧实现「`1d` 满 8 个点就跳过 `23d`」会把这段凭空截掉。
+///
+/// 因此这里**无条件**解析三个字段并按优先级归并，时效性与窗口长度都不再依赖
+/// 「`1d` 恰好少于 8 个点」这种偶然条件。解析器只负责产出可信的时间序列，
+/// 「从什么时候开始截、截多长」仍然由 [`crate::window::select`] 按本次调用时刻决定。
 pub fn parse_hourly_page(html: &str) -> Result<HourlyPayload> {
     let document = Html::parse_document(html);
     let publish_raw = hidden_input(&document, "fc_3h_internal_update_time")
@@ -613,55 +644,72 @@ pub fn parse_hourly_page(html: &str) -> Result<HourlyPayload> {
     })?;
     let value: Value = serde_json::from_str(raw)?;
 
-    let mut points: Vec<HourlyForecast> = Vec::new();
+    // 「日 + 时」只有日号，月/年必须由基准时刻推断；基准优先取页面自己的发布时间，
+    // 页面没给（或改版）时退化为本次抓取时刻。
     let base = published_at.unwrap_or_else(cst_now);
-    if let Some(list) = value.get("1d").and_then(Value::as_array) {
-        for entry in list {
-            if let Some(forecast) = parse_hour_point(entry.as_str(), base) {
-                points.push(forecast);
-            }
-        }
-    }
-    // `1d` 只有 8 个时点（24 小时）。不足 8 个时回落到多日字段：
-    // 实测线上字段名为 `23d`（数组的数组），老版本/部分页面用过 `7d`。
-    if points.len() < 8 {
-        for key in ["23d", "7d"] {
-            let Some(days) = value.get(key).and_then(Value::as_array) else {
-                continue;
-            };
-            for day in days {
-                let Some(list) = day.as_array() else {
-                    continue;
-                };
-                for entry in list {
-                    if let Some(forecast) = parse_hour_point(entry.as_str(), base)
-                        && !points.iter().any(|p| p.time == forecast.time)
-                    {
-                        points.push(forecast);
-                    }
-                }
-            }
-            if points.len() >= 8 {
-                break;
-            }
-        }
+
+    let mut candidates: Vec<(usize, HourlyForecast)> = Vec::new();
+    for (priority, key) in HOURLY_SOURCE_PRIORITY.iter().enumerate() {
+        collect_hour_points(value.get(*key), base, priority, &mut candidates);
     }
 
-    if points.is_empty() {
+    if candidates.is_empty() {
         return Err(WeatherError::Parse(
             "hour3data 中没有可解析的时点（数据源可能已调整结构）".into(),
         ));
     }
-    points.sort_by_key(|point| point.time);
-    points.dedup_by_key(|point| point.time);
-    // 最多保留 32 个时点（约 96 小时），避免长期占用内存。
-    points.truncate(32);
+
+    // 归并：时间升序，同一时刻按字段优先级排（`1d` 在最前）。`sort_by` 是稳定排序，
+    // 因此同一字段内部的原始顺序也会保留 —— 输出与任何哈希容器的迭代顺序无关。
+    candidates.sort_by(|(a_priority, a), (b_priority, b)| {
+        a.time.cmp(&b.time).then(a_priority.cmp(b_priority))
+    });
+    // `dedup_by` 保留每组重复中的**第一个**，也就是优先级最高的那一份：旧预报
+    // 永远不会覆盖更可信的新预报。
+    candidates.dedup_by(|(_, a), (_, b)| a.time == b.time);
+
+    let mut points: Vec<HourlyForecast> = candidates.into_iter().map(|(_, point)| point).collect();
+    // 按时间升序截断，因此超限时丢掉的永远是最远的时点，近期数据不受影响。
+    points.truncate(MAX_HOURLY_POINTS);
 
     Ok(HourlyPayload {
         published_at,
         published_at_raw: publish_raw,
         points,
     })
+}
+
+/// 把一个字段里的所有时点追加进 `out`。
+///
+/// 兼容两种既见布局：`["06日11时,...", …]`（`1d`）与
+/// `[["07日08时,...", …], …]`（`23d` / `7d`）。结构未知的条目直接跳过 ——
+/// 宁可少一个时点，也不去猜它的含义。
+fn collect_hour_points(
+    node: Option<&Value>,
+    base: DateTime<chrono::FixedOffset>,
+    priority: usize,
+    out: &mut Vec<(usize, HourlyForecast)>,
+) {
+    let Some(entries) = node.and_then(Value::as_array) else {
+        return;
+    };
+    for entry in entries {
+        match entry {
+            Value::String(text) => {
+                if let Some(point) = parse_hour_point(Some(text), base) {
+                    out.push((priority, point));
+                }
+            }
+            Value::Array(day) => {
+                for item in day {
+                    if let Some(point) = parse_hour_point(item.as_str(), base) {
+                        out.push((priority, point));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_hour_point(
@@ -679,18 +727,7 @@ fn parse_hour_point(
     let day: u32 = captures.get(1)?.as_str().parse().ok()?;
     let hour: u32 = captures.get(2)?.as_str().parse().ok()?;
 
-    // 数据源只给出「日 + 时」，月份与年份由发布时间推断：日号小于基准日号即进入下个月。
-    let mut year = base.year_of();
-    let mut month = base.month_of();
-    if day < base.day_of() {
-        if month == 12 {
-            month = 1;
-            year += 1;
-        } else {
-            month += 1;
-        }
-    }
-    let time = build_cst(year, month, day, hour, 0)?;
+    let time = resolve_hour_date(base, day, hour)?;
 
     Some(HourlyForecast {
         time,
@@ -1196,6 +1233,46 @@ pub fn build_cst(
     cst_offset().from_local_datetime(&naive).single()
 }
 
+/// 把「日 + 时」还原成完整日期。
+///
+/// 上游只给日号与小时，月/年必须推断。这里在「基准月的前一个月、基准月、基准月的
+/// 后一个月」三个候选里取**离基准时刻最近**的那一个：7 天预报最多偏离发布时间
+/// 7 天，而另外两个候选至少偏离 23 天，所以最近的那个一定是正确的那一个。
+///
+/// 相比旧的「日号小于基准日号就进下个月」规则，这条同时处理两种情况：
+///
+/// * 跨月 / 跨年：`11-30` 页面上的 `01日02时` 归到 `12-01`，`12-31` 上的 `01日`
+///   归到次年 `01-01`；
+/// * **内联数据比发布时间更早**：页面 07:30 刷新、`1d` 仍带 `05日23时` 时，
+///   旧规则会把 `05日` 算成下个月的同一天，凭空造出一份一个月后的天气。
+fn resolve_hour_date(
+    base: DateTime<chrono::FixedOffset>,
+    day: u32,
+    hour: u32,
+) -> Option<DateTime<chrono::FixedOffset>> {
+    let mut best: Option<(i64, DateTime<chrono::FixedOffset>)> = None;
+    // 顺序 0 / +1 / -1：严格小于比较下偏离最小的候选胜出，平局时「当月」优先，
+    // 因此结果与候选的枚举顺序无关、完全确定。
+    for delta in [0i32, 1, -1] {
+        let (year, month) = shift_month(base.year_of(), base.month_of(), delta);
+        let Some(candidate) = build_cst(year, month, day, hour, 0) else {
+            // 例如 2 月没有 30 日：这个候选不存在，换下一个。
+            continue;
+        };
+        let distance = (candidate - base).num_seconds().abs();
+        if best.is_none_or(|(best_distance, _)| distance < best_distance) {
+            best = Some((distance, candidate));
+        }
+    }
+    best.map(|(_, candidate)| candidate)
+}
+
+/// 把 `(年, 月)` 平移 `delta` 个月，并正确处理跨年。
+fn shift_month(year: i32, month: u32, delta: i32) -> (i32, u32) {
+    let months = year * 12 + (month as i32 - 1) + delta;
+    (months.div_euclid(12), (months.rem_euclid(12) + 1) as u32)
+}
+
 /// 当前北京时间。
 pub fn cst_now() -> DateTime<chrono::FixedOffset> {
     chrono::Utc::now().with_timezone(&cst_offset())
@@ -1525,9 +1602,9 @@ mod tests {
         assert_eq!(bundle.reference_time, None);
     }
 
-    /// 线上多日字段叫 `23d`，`1d` 不足 8 个点时必须能回落到它。
+    /// 线上多日字段叫 `23d`（数组的数组），`1d` 不足 8 个点时必须能续上它。
     #[test]
-    fn hourly_falls_back_to_23d_when_1d_is_short() {
+    fn hourly_merges_23d_when_1d_is_short() {
         let html = r#"<html><body>
 <input type="hidden" id="fc_3h_internal_update_time" value="2026-11-06 08:00"/>
 <script>var hour3data={"1d":["06日11时,d00,晴,12℃,西风,<3级,1"],"23d":[["06日14时,d00,晴,13℃,东南风,<3级,1","06日17时,d00,晴,13℃,东南风,<3级,1"]]};</script>

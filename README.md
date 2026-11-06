@@ -108,7 +108,7 @@ MCP client ──stdio JSON-RPC──▶ WeatherServer (server.rs)
 | --- | --- | --- |
 | 实况观测 | `https://d1.weather.com.cn/sk_2d/{code}.html` | `var dataSK={...}`：气温、天气现象、湿度、风向、风力、风速、气压、能见度、1h/24h 降水、AQI、观测时间 |
 | 7 日预报 | `https://www.weather.com.cn/weather/{code}.shtml` | HTML，`ul.t > li` 七个条目：日期、天气、最高/最低温、风向、风力、发布时间 |
-| 逐 3 小时预报 | `https://www.weather.com.cn/weather1d/{code}.shtml` | 页面内联 `var hour3data={...}`，粒度 **3 小时** |
+| 逐 3 小时预报 | `https://www.weather.com.cn/weather1d/{code}.shtml` | 页面内联 `var hour3data={...}`，粒度 **3 小时**；含 `1d`（未来 24 小时，8 个时点）、`23d`（第 2~3 天）、`7d`（7 天全集）三个字段 |
 | 气象预警 | `https://d1.weather.com.cn/dingzhi/{code}.html` | `var alarmDZ{code}={...}`：类型、级别、发布时间、失效时间、正文 |
 | 城市编码库 | `https://j.i8tq.com/weather2020/search/city.js` | 站点城市选择器的官方数据：`{省:{市:{区:{AREAID,NAMECN}}}}` |
 
@@ -124,7 +124,7 @@ MCP client ──stdio JSON-RPC──▶ WeatherServer (server.rs)
 **使用限制与自律**：
 
 - 只读公开页面，不登录、不绕过任何访问控制、不使用验证码识别或代理池。
-- 同一主机的请求间隔默认 **350 ms**（`WEATHER_MCP_MIN_INTERVAL_MS`），并发上限默认 **4**；成功响应超过 **4 MiB**、错误响应超过 **32 KiB** 都直接截断失败，避免异常响应把内存吃满。限速保证的是**真实发送时刻**之间的间隔，不是「预约时刻」的间隔（见[限速与并发](#限速与并发信号量与主机限速器的顺序)）。
+- 同一主机的请求间隔默认 **350 ms**（`WEATHER_MCP_MIN_INTERVAL_MS`），并发上限默认 **4**；成功响应超过 **4 MiB**、错误响应超过 **32 KiB** 都直接截断失败，避免异常响应把内存吃满。限速保证的是**派发锚点**之间的间隔（锚点与 `send()` 之间没有任何 `.await`，因此 Tokio 调度器插不进去），不是「预约时刻」的间隔；OS 抢占与连接建立会让真实到达再晚一点，只会更分散、不会更密集（见[限速与并发](#限速与并发信号量与主机限速器的顺序)）。
 - 缓存默认值：实况 5 分钟、预报 30 分钟、逐 3 小时 30 分钟、预警 10 分钟；按「最近使用」淘汰，失败结果不缓存。
 - 数据版权归中国天气网及其数据提供方所有。本项目只做个人/内部查询用途的转发，**不得用于商业再分发**；请勿移除结果中的 `source` 字段。
 
@@ -428,6 +428,22 @@ weather-mcp-cn [选项]
 
 > ⚠️ 中国天气网公开数据只有 3 小时粒度。本工具返回时间窗内每 3 小时一个时点，**不做任何插值**。若需要逐 1 小时数据，本数据源确实不提供。
 
+**时点来源与合并**（`src/providers/weather_com_cn.rs`）：
+
+`hour3data` 里有三个逐时字段，覆盖范围与权威程度都不同。解析器**无条件**解析全部三个字段并按优先级归并：
+
+| 字段 | 线上布局 | 覆盖范围 | 优先级 |
+| --- | --- | --- | --- |
+| `1d` | `["06日11时,...", …]` 8 个元素 | 未来 24 小时 | 最高（第 1 天以它为准） |
+| `23d` | `[["07日08时,...", …], …]` | 第 2~3 天 | 次之 |
+| `7d` | `[["06日11时,...", …] × 7]` | 未来 7 天 | 最低，只用来补齐前两者缺的时点 |
+
+归并规则：先按时间升序、同一时刻按字段优先级排序（稳定排序，输出与哈希容器迭代顺序无关），再按时间戳去重并**保留优先级最高的那一份**，最后按时间升序截断到 `MAX_HOURLY_POINTS = 32` 个时点（96 小时）——超限时丢掉的永远是最远的时点，近期数据不受影响。
+
+> 为什么不能只看 `1d`：`1d` 的 8 个时点只保证覆盖「从**首个预报时点**起的 24 小时」，不保证覆盖「从**调用时刻**起的 24 小时」。2026-11-06 的北京页面里 `1d` 是 `06日11时` → `07日08时`（区间到 `07日11时`），而用户在 `06日14时` 请求 24 小时时截止时刻是 `07日14时`，缺的那一段正好在 `23d` 里。旧实现用 `if points.len() < 8` 判断要不要读 `23d` / `7d`，于是窗口被凭空截断到 21 小时（见 `full_real_page_covers_a_full_day_window_after_merge`）。
+
+「日号 → 完整日期」的推断也换了规则：在「基准月前一个月 / 基准月 / 后一个月」三个候选里取**离发布时间最近**的那一个。它同时正确处理跨月、跨年，以及「页面已刷新、内联数据还停在昨天」的情况（旧规则会把 `05日23时` 算成下个月的同一天，凭空造出一份一个月后的天气）。
+
 **时间窗口语义**（`src/window.rs`，用注入的固定时钟做确定性测试）：
 
 一个 `11:00` 的时点代表区间 `[11:00, 14:00)`。窗口以本次调用的「现在」（`reference_time`）为基准：
@@ -658,10 +674,19 @@ coverage_end     = 最后一段 segment 的结束时刻（不会超过 deadline�
 
 1. 先进入**主机独占区**：同一主机同一时刻只有一个请求在这里排队等自己的时间片，**限速等待期间不占用任何并发许可**；
 2. 再申请全局并发许可；
-3. 拿到许可、真正发送之前调用 `HostLease::anchor()`，把「下一次最早发送时刻」锚定到 `Instant::now()`——记录的是真实发送时刻；
+3. 请求对象先完整构造好，最后才调用 `HostLease::anchor()` 把「下一次最早发送时刻」锚定到 `Instant::now()`，紧接着 `send().await`——**锚点与 `send()` 的首次 poll 之间没有任何 `.await`**；
 4. 锚定后立刻释放主机独占区，让同主机的下一个请求开始等它自己的时刻，本次请求继续带着并发许可读响应体。
 
 不同主机的独占区互不相关，可并行推进；全局并发上限、请求超时、重试与指数退避完全不受影响。`tests/http_behavior_tests.rs` 用本地回放服务器记录**真实到达时刻**，断言「4 个请求长期占满许可 → 其余请求排队 → 许可集中释放」之后间隔依然 ≥ 最小间隔（容差 25 ms），并断言服务端观测到的并发不超过配置上限。
+
+**这份保证的边界（不夸大）**：锚点与 `send()` 的首次 poll 处在同一个任务 poll 里，因此单线程与多线程 Runtime 都无法在两者之间插入另一个同主机请求。剩下两段偏差不在本层可控范围内，测试里用本地回环实测过它们的量级：
+
+| 偏差来源 | 影响 | 方向 |
+| --- | --- | --- |
+| 操作系统线程抢占（`anchor()` 之后的任意指令处） | 微秒级，极端负载下可能到毫秒级 | 真实发送比锚点晚 |
+| 连接建立（DNS / TCP / TLS 在 `send()` 的后续 poll 里） | 本地回环个位数毫秒，冷连接可到几十毫秒 | 真实发送比锚点晚 |
+
+两者都只会让真实到达**更分散**，不会更密集。所以准确的表述是「**派发锚点**之间的间隔不小于 `min_request_interval`」，而不是「socket 写出的绝对时刻被精确控制」。`anchor_time_matches_the_real_request_arrival` 断言「服务端到达时刻 − 客户端锚点」在本地回环上 ≤ 100 ms；`consecutive_anchors_obey_the_min_interval` 与 `retries_re_enter_the_host_gate` 分别覆盖顺序请求与重试；`cancelling_a_throttled_request_does_not_wedge_the_host_gate` 与 `cancelling_while_waiting_for_a_permit_does_not_leak_it` 覆盖取消安全（不卡死主机闸门、不吞并发许可）。锚点记录是 `#[cfg(test)]` 字段，生产构建里根本不存在。
 
 ---
 
@@ -740,26 +765,37 @@ cargo clippy --all-targets --locked --no-default-features --features tls-native-
 
 | 目标 | 数量 | 内容 |
 | --- | --- | --- |
-| `src/lib.rs` 单元测试 | 93 | LRU/TTL 淘汰（含链表不变量校验与中毒恢复）与 singleflight、窗口语义（跨日/月/年/闰日/时区/1-3-12-24 小时、缺口、重叠、截止时刻边界）、限速器主机隔离、预警异常结构、HTTP 体积上限、解析器、城市后缀 |
-| `tests/parser_tests.rs` | 15 | **真实抓取样本**离线验证四个解析器，含空预警/`w:null`/损坏 JSON 与 67 KB 完整页面 |
+| `src/lib.rs` 单元测试 | 100 | LRU/TTL 淘汰（含链表不变量校验、TTL 不续期与中毒恢复）与 singleflight、窗口语义（跨日/月/年/闰日/时区/1-3-12-24 小时、缺口、重叠、截止时刻边界）、限速器主机隔离与**锚点/取消安全**、预警异常结构、HTTP 体积上限、解析器、城市后缀、MCP 工具层真实页面窗口 |
+| `tests/parser_tests.rs` | 25 | **真实抓取样本**离线验证四个解析器，含空预警/`w:null`/损坏 JSON、67 KB 完整页面，以及 `1d`/`23d`/`7d` 的合并、冲突、缺失、乱序、跨月/跨年、时点数上限 |
 | `tests/city_tests.rs` | 12 | 内置 3221 条城市库的名称/代码/层级/歧义解析 |
 | `tests/provider_cache_tests.rs` | 6 | **真实缓存实现** + 回放样本：交叉查询上下文隔离、命中不打上游、并发 singleflight、失败不缓存 |
 | `tests/window_coverage_tests.rs` | 10 | 逐 3 小时覆盖时长的真实交集：只有最后 3 小时有数据、缺口、重叠/重复、不规则时点、部分小时、跨年/闰日 |
-| `tests/http_behavior_tests.rs` | 5 | 本地回放服务器：大体积 403/500（含分块、无 `Content-Length`）有界读取、错误页提前断开、CDN 拦截页分类、**许可集中释放时的真实发送间隔** |
+| `tests/http_behavior_tests.rs` | 6 | 本地回放服务器：大体积 403/500（含分块、无 `Content-Length`）有界读取、声明超长 `Content-Length` 提前拒绝、错误页提前断开、CDN 拦截页分类、**许可集中释放时的真实发送间隔** |
 | `tests/cache_singleflight_tests.rs` | 2 | 可控同步复现「检查缓存 ↔ 注册 flight」竞态；连续失败时不放大加载次数 |
 | `tests/mcp_tests.rs` | 7 | **真正启动二进制**走 stdio：`initialize` → `tools/list` → `tools/call` → 工具错误语义 → 出错后继续服务 |
 | `tests/live_tests.rs` | 14 | 联网集成测试（含 403/CDN 拦截回归），默认 `#[ignore]` |
 
-`cargo test` 汇总：**150 passed, 0 failed, 14 ignored**（三套 TLS feature 组合同样全绿）。
+`cargo test` 汇总：**168 passed, 0 failed, 14 ignored**（三套 TLS feature 组合同样全绿）。
 
 关键回归用例：
 
 | 用例 | 守护的行为 |
 | --- | --- |
+| `full_real_page_covers_a_full_day_window_after_merge` | `1d` 满 8 个点时仍然合并 `23d`：06日14时 请求 24 小时能覆盖到 07日14时（旧实现只到 07日11时，覆盖 21 小时） |
+| `hourly_tool_reports_full_coverage_from_the_merged_real_page` | MCP 层用完整真实页面算出 `covered_hours = contiguous_hours = 24`，`hours[]` 含次日 11:00 与 14:00 |
+| `merges_23d_even_when_1d_already_has_eight_points` / `prefers_1d_then_23d_then_7d_for_duplicate_instants` | 合并优先级：同一时刻取 `1d` → `23d` → `7d`，旧预报不覆盖更可信的新预报 |
+| `sorts_unordered_fields_into_one_chronological_series` / `drops_unparsable_entries_without_inventing_data` | 乱序输入归一为严格升序；非法条目被丢弃且不编造数据 |
+| `infers_month_and_year_across_the_boundary` / `keeps_points_earlier_than_the_publish_time_in_the_same_month` | 「日 + 时」→ 完整日期：跨月/跨年正确，页面刷新早于内联数据时也不会算到下个月 |
+| `caps_the_series_without_dropping_near_term_points` | 超过 `MAX_HOURLY_POINTS` 时丢弃最远的时点，近期数据不受影响 |
 | `only_the_last_three_hours_does_not_claim_twelve` | 只有最后一个时点落在窗口内时，`covered_hours` 报 3 而不是 12（旧实现报 12） |
 | `gap_between_buckets_is_not_counted_as_coverage` / `contiguous_hours_stop_at_the_first_gap` | 缺口不计入累计覆盖；连续覆盖在第一个缺口处停止 |
 | `bucket_exactly_at_the_deadline_covers_nothing` | 时点恰好等于截止时刻时返回结构化工具错误 |
 | `same_host_sends_keep_the_min_interval_when_permits_are_released_together` | 许可集中释放后同主机真实发送间隔仍 ≥ 配置值（旧实现实测 2.6 µs） |
+| `anchor_time_matches_the_real_request_arrival` | 客户端锚点与服务端真实到达时刻的偏差在本地回环上 ≤ 100 ms |
+| `consecutive_anchors_obey_the_min_interval` / `retries_re_enter_the_host_gate` | 顺序请求与重试都重新排队等限速（锚点与真实到达两条口径同时断言） |
+| `cancelling_a_throttled_request_does_not_wedge_the_host_gate` / `cancelling_while_waiting_for_a_permit_does_not_leak_it` | 取消不卡死主机闸门，也不吞掉全局并发许可 |
+| `declared_oversized_content_length_is_rejected_before_reading` | 声明 `Content-Length` 超过 4 MiB 的 2xx 响应在读之前就失败 |
+| `reads_do_not_extend_the_ttl` | 命中只改变 LRU 顺序，不延长 TTL |
 | `oversized_403_body_is_read_with_a_cap` / `oversized_chunked_500_body_is_read_with_a_cap` | 32 MB 错误页不会整体读进内存 |
 | `truncated_error_body_is_reported_not_swallowed` | 错误页读到一半断开时如实写进诊断 |
 | `becoming_leader_rechecks_the_cache_before_loading` | 成为 leader 后回查缓存，不重复加载（旧实现加载 2 次） |
@@ -841,7 +877,7 @@ pwsh -File scripts/mcp-e2e.ps1 -Binary target\release\weather-mcp-cn.exe
 这是 MCP 规范的推荐做法：请求本身合法、工具也确实执行了，只是业务上失败（城市不存在、上游超时、时间窗没数据），这类信息属于「工具结果」，客户端会把 `content` 展示给模型，模型据此改写查询或重试。只有请求无法路由/解析（未知工具名、报文不是合法 JSON-RPC、参数反序列化失败）才是 JSON-RPC `error`——那种情况下客户端往往只显示一句「内部错误」，信息全丢。`structuredContent.code` 是稳定错误码，`retryable` 与 `hint` 直接告诉 Agent 该不该重试。
 
 **Q：为什么 `covered_hours` 小于我请求的 `hours`？**
-三种可能：上游只提供了有限时点（例如 `hour1d` 只给 24 小时）；数据的最后一个时点所在区间在截止时刻前就结束了；**窗口中间有缺口**。`covered_hours` 统计的是「请求窗口与数据区间的真实交集总长度」，缺口不计入；`contiguous_hours` 统计从此刻起连续能答多久，两者不相等就说明中间有缺口（例如只有 19:00 一个时点时，`covered_hours=3` 而 `contiguous_hours=0`）。项目不会用 `max(3)` 之类的手段把数字凑大，也不对空档做插值。
+三种可能：上游只提供了有限时点（解析器会把 `1d`/`23d`/`7d` 全部合并，但再远就没有数据了）；数据的最后一个时点所在区间在截止时刻前就结束了；**窗口中间有缺口**。`covered_hours` 统计的是「请求窗口与数据区间的真实交集总长度」，缺口不计入；`contiguous_hours` 统计从此刻起连续能答多久，两者不相等就说明中间有缺口（例如只有 19:00 一个时点时，`covered_hours=3` 而 `contiguous_hours=0`）。项目不会用 `max(3)` 之类的手段把数字凑大，也不对空档做插值。
 
 **Q：为什么 `contiguous_hours` 比 `covered_hours` 小？**
 说明窗口里有数据缺口。`covered_hours` 是累计值，`contiguous_hours` 在第一个缺口处就停止计数——如果你的 Agent 要回答「接下来连续 N 小时会不会下雨」，应该用 `contiguous_hours` 判断可信区间。

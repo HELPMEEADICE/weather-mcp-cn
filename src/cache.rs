@@ -601,6 +601,26 @@ mod tests {
         assert_eq!(cache.len(), 0, "过期条目不应再计入容量");
     }
 
+    /// 命中只改变 LRU 顺序，不延长 TTL：TTL 永远是「写入时刻 + ttl」。
+    ///
+    /// 这条边界很容易被「顺手把 `expires_at` 也刷一下」的改动破坏，而它一旦被破坏，
+    /// 高频命中的键就永远不会过期，缓存会一直吐旧数据。
+    #[test]
+    fn reads_do_not_extend_the_ttl() {
+        let cache: TtlCache<u32, u32> = cache(Duration::from_millis(120), 4);
+        cache.insert(1, 10);
+
+        // TTL 内持续命中（sleep 只会多睡，不会少睡，因此累计时长只多不少）。
+        for _ in 0..4 {
+            std::thread::sleep(Duration::from_millis(20));
+            assert_eq!(cache.get(&1), Some(10));
+        }
+        // 已经过去 ≥80ms，再睡 60ms 就越过了原始 120ms 的 TTL。
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(cache.get(&1), None, "读取不得延长 TTL");
+        assert_eq!(cache.len(), 0);
+    }
+
     #[test]
     fn zero_ttl_is_never_returned() {
         let cache: TtlCache<u32, u32> = cache(Duration::from_secs(60), 4);

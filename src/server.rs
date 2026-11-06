@@ -456,6 +456,15 @@ mod tests {
         Arc::new(move || now)
     }
 
+    /// 2026 年 11 月的固定时钟（用于真实页面样本）。
+    fn fixed_clock_at(day: u32, hour: u32, minute: u32) -> Clock {
+        let now = cst_offset()
+            .with_ymd_and_hms(2026, 11, day, hour, minute, 0)
+            .single()
+            .expect("合法时间");
+        Arc::new(move || now)
+    }
+
     fn hourly_points(start_hour: u32, count: usize) -> Vec<HourlyForecast> {
         let base = cst_offset()
             .with_ymd_and_hms(2026, 11, 5, start_hour, 0, 0)
@@ -563,6 +572,71 @@ mod tests {
         assert_eq!(payload["contiguous_hours"], 2, "{payload}");
         assert_eq!(payload["coverage_end"], "2026-11-06T08:00:00+08:00");
         assert_eq!(payload["hours"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// 真实 2026-11-06 北京页面（67 KB）：`1d` 只给 8 个时点（到 07日08时），
+    /// 但 `23d` 里还有 07日11时、07日14时。
+    ///
+    /// 在 06日14时 请求未来 24 小时（截止 07日14时），旧实现因为 `1d` 满 8 个点就跳过
+    /// `23d`，`covered_hours` 只有 21；现在必须如实算出 24 小时。
+    #[tokio::test]
+    async fn hourly_tool_reports_full_coverage_from_the_merged_real_page() {
+        const REAL_PAGE: &str = include_str!("../tests/fixtures/hourly_1d_101010100_20261106.html");
+
+        let points = crate::providers::weather_com_cn::parse_hourly_page(REAL_PAGE)
+            .expect("真实页面应可解析")
+            .points;
+        assert_eq!(points.len(), 32, "1d + 23d + 7d 合并后的时点数");
+
+        let provider = Arc::new(FakeProvider::new(points));
+        let server = server(provider, fixed_clock_at(6, 14, 0));
+
+        let result = server
+            .get_hourly_weather(Parameters(HourlyQuery {
+                city: "北京".into(),
+                hours: Some(24),
+            }))
+            .await
+            .expect("工具调用本身不应报协议错误");
+
+        let payload = payload(&result);
+        assert_eq!(payload["requested_hours"], 24);
+        assert_eq!(
+            payload["covered_hours"], 24,
+            "窗口必须被完整覆盖：{payload}"
+        );
+        assert_eq!(payload["contiguous_hours"], 24, "而且是连续覆盖");
+        assert_eq!(payload["reference_time"], "2026-11-06T14:00:00+08:00");
+        assert_eq!(payload["coverage_end"], "2026-11-07T14:00:00+08:00");
+
+        let hours = payload["hours"].as_array().expect("hours 数组");
+        assert_eq!(
+            hours.len(),
+            9,
+            "14/17/20/23、02/05/08/11/14 共 9 个时点：{payload}"
+        );
+        let times: Vec<&str> = hours
+            .iter()
+            .filter_map(|entry| entry["time"].as_str())
+            .collect();
+        assert_eq!(
+            times,
+            vec![
+                "2026-11-06T14:00:00+08:00",
+                "2026-11-06T17:00:00+08:00",
+                "2026-11-06T20:00:00+08:00",
+                "2026-11-06T23:00:00+08:00",
+                "2026-11-07T02:00:00+08:00",
+                "2026-11-07T05:00:00+08:00",
+                "2026-11-07T08:00:00+08:00",
+                "2026-11-07T11:00:00+08:00",
+                "2026-11-07T14:00:00+08:00",
+            ],
+            "必须包含次日 11:00 与 14:00"
+        );
+        // 07日11时 的数据来自 `23d`，不是凭空补的。
+        assert_eq!(hours[7]["temperature_c"], 5);
+        assert_eq!(hours[7]["weather"], "多云");
     }
 
     #[tokio::test]

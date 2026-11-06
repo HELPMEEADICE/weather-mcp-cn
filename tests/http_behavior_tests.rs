@@ -453,6 +453,33 @@ async fn truncated_error_body_is_reported_not_swallowed() {
     );
 }
 
+/// 声明了超大 `Content-Length` 的 2xx 响应必须**在读之前**就被拒绝。
+///
+/// 这条路径与「读着读着超限」不同：没有前者，一个 `Content-Length: 8 GiB` 的
+/// 成功响应会先把连接挂着读到超时，而不是立刻失败。
+#[tokio::test]
+async fn declared_oversized_content_length_is_rejected_before_reading() {
+    let server = spawn(Reply {
+        status: "200 OK",
+        content_type: "text/html",
+        extra_headers: vec![],
+        body: Body::Truncated {
+            declared: 8 * 1024 * 1024,
+            sent: 0,
+        },
+    })
+    .await;
+
+    let err = client()
+        .get_text(&server.url("/huge-declared"), None)
+        .await
+        .expect_err("声明长度超限必须提前拒绝");
+
+    assert_eq!(err.code(), "parse_error", "{err}");
+    assert!(err.to_string().contains("字节上限"), "{err}");
+    assert!(!err.is_retryable(), "超限重试没有意义：{err}");
+}
+
 /// 正常的 CDN 拦截页（体积很小）仍要能识别出 `Forbid_code`，不能被上限改造破坏。
 #[tokio::test]
 async fn cdn_forbid_page_keeps_its_classification() {
