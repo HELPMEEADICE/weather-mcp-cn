@@ -100,6 +100,15 @@ MCP client ──stdio JSON-RPC──▶ WeatherServer (server.rs)
               CallToolResult{structuredContent} 或 {isError:true, code, hint}
 ```
 
+### 内联 JSON 块的提取边界
+
+四个数据块（`dataSK` / `hour3data` / `alarmDZ` / 城市库）都是内联在页面里的 JSON，`extract_json_object()` 的两条约束决定了「哪里才算数据起点」：
+
+- **标识符边界**：marker 的前一个字符不能是 ASCII 字母 / 数字 / `_` / `$`，否则继续往后找下一个匹配 —— `hour3data` 不会命中 `myhour3data`、`hour3data_old`。
+- **间隔上限 + 内容白名单**：marker 到 `{` 之间最多 `MAX_JSON_LEAD = 64` 字节，且这段 gap 只允许「标识符续接字符 + 空白 + 可选 `=`」。`alarmDZ101060101 ={...}` 这类城市代码续接能通过，`var hour3data=;var cfg={"debug":1};` 不能通过。
+
+数据块缺失时返回 `None`，上层报 `parse_error`，而不是把页面下游某个无关的 `{`（内联 CSS、另一个 `<script>`）当成数据起点。
+
 ---
 
 ## 数据来源与使用限制
@@ -408,6 +417,29 @@ weather-mcp-cn [选项]
 
 返回：`city`、`temperature_c`、`weather`、`humidity_percent`、`wind_direction`、`wind_scale`、`wind_speed_kmh`、`pressure_hpa`、`visibility_km`、`precipitation_mm`、`precipitation_24h_mm`、`aqi`、`observed_at`、`observed_at_raw`、`observed_at_note`、`missing_fields`、`source`、`is_observation`。
 
+**有效性门槛**（`has_any_measurement` / `parse_current_js`）：`dataSK` 必须至少命中 1 个核心气象字段——气温、天气现象、湿度、风向、风力、风速、1 小时降水、24 小时降水、气压、能见度、AQI 之一——才算「查到了实况」。`var dataSK={};`、`{"cityname":"北京"}`、`{"temp":"N/A"}` 一律返回 `parse_error`（`kind=upstream_format`、`retryable=false`），绝不会被当成「查到了但没有数据」。观测时间不参与这个判定：时间缺失只体现为 `observed_at` 缺失与 `observed_at_note` 里的说明，不影响「有没有气象数据」这个更基本的事实。
+
+**缺失字段与物理量程**：
+
+- 所有可能缺失的字段都是 `Option`，缺失时**不出现在 JSON 里**（`skip_serializing_if`），绝不填 `0` / `0.0` / `""`。
+- `missing_fields` 列出数据源本次真实未提供的字段名，用来区分「没数据」和「数据是 0」。固定追踪 13 个字段：`feels_like_c`、`temperature_c`、`weather`、`humidity_percent`、`wind_direction`、`wind_scale`、`wind_speed_kmh`、`precipitation_mm`、`precipitation_24h_mm`、`pressure_hpa`、`visibility_km`、`aqi`、`observed_at`。
+- 读数时逐字段校验物理量程：非有限值（`NaN` / `±inf`）与超范围值一律判为**缺失**，不会作为观测值返回，也不参与上面的有效性门槛；被量程拒绝的值同时**记入 `missing_fields`**，因此调用方可以区分「上游没给」与「给了但被量程拒绝」。
+- 文本哨兵 `暂无`、`无`、`N/A`、`n/a`、`null`、`-`、`--` 与空串同样视为「未提供」。
+- 数值缺失**不靠**魔法数字：`999` / `-999` / `9999` 都不是缺失标记。`qy=999` 落在气压量程内，是有效气压 `Some(999.0)`；`temp=999` 超出气温量程，仍然是缺失。
+
+| 字段 | 键 | 合法区间（闭区间） | 超范围时 |
+| --- | --- | --- | --- |
+| 气温 ℃ | `temp` | -90 ~ 60 | 判为缺失 |
+| 湿度 % | `SD` | 0 ~ 100 | 判为缺失 |
+| 气压 hPa | `qy` | 300 ~ 1100 | 判为缺失 |
+| 能见度 km | `njd` | 0 ~ 100 | 判为缺失 |
+| 风速 km/h | `wse` | 0 ~ 500 | 判为缺失 |
+| 1h 降水 mm | `rain` | 0 ~ 3000 | 判为缺失 |
+| 24h 降水 mm | `rain24h` | 0 ~ 3000 | 判为缺失 |
+| AQI | `aqi` | 0 ~ 1000 | 判为缺失 |
+
+量程是「异常输入 → 成功」的主闸门：`{"temp":"99999","SD":"250","qy":"1","njd":"-5"}` 的四个字段全部判为缺失；此时只要还有别的核心字段命中，这次调用仍是一次成功观测，而不是因为个别字段离谱就整条失败。
+
 ### `get_weather_forecast`
 
 | 参数 | 类型 | 必填 | 说明 |
@@ -416,6 +448,21 @@ weather-mcp-cn [选项]
 | `days` | integer | ❌ | 1–7，默认 3 |
 
 返回：`published_at`、`published_at_raw`、`available_days`、`days[]`（`date`、`weekday`、`label`、`weather`、`weather_day`、`weather_night`、`temperature_high_c`、`temperature_low_c`、`wind_direction_day`、`wind_direction_night`、`wind_scale`）、`weather_split_note`、`source`。
+
+**日期推断**（`resolve_forecast_date` / `MAX_FORECAST_STEP_DAYS = 7`，`parse_forecast_page`）：页面标题只给「日号」，月/年必须推断。判据是两条**同时**成立——候选月份只允许「锚点所在月」与「它的下一个月」；候选与锚点的间隔必须 ≤ `MAX_FORECAST_STEP_DAYS = 7` 天。
+
+| 锚点 + 标题 | 结果 | 依据 |
+| --- | --- | --- |
+| `11-30` + `01日` | `12-01` | 同月没有 1 日 → 下月候选，间隔 1 天，合法跨月 |
+| `11-06` + `31日` | 跳过该条目 | 同月没有 31 日 → 下月候选间隔 55 天，超过 7 天，判为坏标题 |
+| `11-06` + `00日` / `32日` | 跳过该条目 | 任何月份都不存在这一天 |
+| `02-01` + `29日`（平年） | 跳过该条目 | 该年 2 月没有 29 日 |
+
+- 该月不存在的日号（平年 `02月29日`、30 天月份里的 `31日`）一律判为无效，**不会**被替换成任何看似合理的日期。
+- `今天` / `明天` / `后天` 标签只作为**期望日期**：标题里的日号必须与标签推出的日期一致，不一致就整条跳过，不会把期望日期硬塞进去。
+- 重复日期与逆序日期（`date <= 上一条被接受的日期`）跳过该条目，并且**不推进**日期游标——被跳过的条目不会污染后续条目的日期基准。
+- 无标签条目的锚点取上一条**被接受**的日期；首条条目退化为预报发布时间，发布时间缺失时用抓取日期。
+- 解析不到足够可信数据时返回 `parse_error`，`message` 区分两种原因：「未解析到任何 `ul.t > li` 条目（页面结构可能已变化）」与「条目的日期全部无效（上游可能返回了损坏的日期标题）」。
 
 ### `get_hourly_weather`
 
@@ -438,7 +485,15 @@ weather-mcp-cn [选项]
 | `23d` | `[["07日08时,...", …], …]` | 第 2~3 天 | 次之 |
 | `7d` | `[["06日11时,...", …] × 7]` | 未来 7 天 | 最低，只用来补齐前两者缺的时点 |
 
-归并规则：先按时间升序、同一时刻按字段优先级排序（稳定排序，输出与哈希容器迭代顺序无关），再按时间戳去重并**保留优先级最高的那一份**，最后按时间升序截断到 `MAX_HOURLY_POINTS = 32` 个时点（96 小时）——超限时丢掉的永远是最远的时点，近期数据不受影响。
+归并规则（`parse_hourly_page`）：
+
+1. 三个字段**无条件全部解析**后进入同一个候选池，不再依赖「`1d` 少于 8 个点才读 `23d`」这种偶然条件。
+2. 排序键三级：**时间升序 → 有效记录优先 → 来源优先级 `1d` > `23d` > `7d`**（`sort_by` 是稳定排序，输出与哈希容器的迭代顺序无关）。
+3. 按时间戳去重，保留每组里的第一条，也就是「先有效、再高优先级」的那一份。选的是**整条记录**，不做跨源字段拼接：高优先级记录即使部分字段缺失，也不会从低优先级候选里借字段拼成一条上游从未给出过的混合记录，缺失就是缺失。
+4. 高优先级记录**整体为空**时不会覆盖低优先级记录——它会先被下面的有效性门槛淘汰，让完整的低优先级记录胜出（`1d` 的空记录挤不掉 `23d` 的完整记录）。
+5. 按时间升序截断到 `MAX_HOURLY_POINTS = 32` 个时点（96 小时）。截断发生在有效性过滤**之后**，所以空记录永远挤不掉近期有效数据；超限时丢掉的永远是最远的时点。
+
+**时点有效性门槛**（`hour_point_has_data`）：一条时点记录必须至少携带 1 项真实气象信息——天气现象、气温、风向、风力四者之一——才算有效。只有时间戳、其余全空的记录（例如 `"06日11时,,,,,"`）会被**整条丢弃**，绝不会当成一条「没有数据的预报」返回。`icon_code` **不算**气象信息（它只是渲染编号），时间戳同样不算。丢弃会在时间序列里留下**空洞**——空洞是诚实的，本项目不补点、不插值，缺口体现在 `covered_hours` 与 `contiguous_hours` 的差值上。
 
 > 为什么不能只看 `1d`：`1d` 的 8 个时点只保证覆盖「从**首个预报时点**起的 24 小时」，不保证覆盖「从**调用时刻**起的 24 小时」。2026-11-06 的北京页面里 `1d` 是 `06日11时` → `07日08时`（区间到 `07日11时`），而用户在 `06日14时` 请求 24 小时时截止时刻是 `07日14时`，缺的那一段正好在 `23d` 里。旧实现用 `if points.len() < 8` 判断要不要读 `23d` / `7d`，于是窗口被凭空截断到 21 小时（见 `full_real_page_covers_a_full_day_window_after_merge`）。
 
@@ -739,7 +794,7 @@ MCP 把失败分成两层，本项目严格区分：
 | `upstream_blocked` | upstream | ✅ | 被 CDN 拦截（`Forbid_code=020200` 表示 Referer 不合规，`020300` 表示 User-Agent 不合规） | 见[常见问题](#常见问题)里的 403 排查 |
 | `upstream_unavailable` | upstream | ✅ | 连接失败 / 响应无法识别 | 稍后重试 |
 | `timeout` | upstream | ✅ | 请求超时 | 稍后重试或调大 `WEATHER_MCP_REQUEST_TIMEOUT_SECS` |
-| `parse_error` | upstream_format | ❌ | 页面 / 接口结构变化导致解析失败 | 提 issue，附 `source.url` |
+| `parse_error` | upstream_format | ❌ | 解析失败：页面 / 接口结构变化、数据块缺失、实况 `dataSK` 不含任何气象字段、预报日期标题全部无效、逐 3 小时时点全部为空 | 提 issue，附 `source.url` |
 
 **任何工具执行错误都不会让进程退出**：`server_keeps_serving_after_errors` 会连续触发 6 次失败调用（工具错误 + 未知工具），然后确认服务器仍能正常列工具、正常查询。
 
