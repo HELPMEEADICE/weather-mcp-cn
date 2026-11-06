@@ -605,18 +605,35 @@ mod tests {
     ///
     /// 这条边界很容易被「顺手把 `expires_at` 也刷一下」的改动破坏，而它一旦被破坏，
     /// 高频命中的键就永远不会过期，缓存会一直吐旧数据。
+    ///
+    /// # 时间余量（不要在 CI 上收紧）
+    ///
+    /// 要区分「命中续期」这个缺陷，断言时刻必须落在「写入时刻 + ttl」**之后**、
+    /// 但明显**早于**「最后一次命中 + ttl」之前：
+    ///
+    /// ```text
+    /// 写入 t0 ──500ms── 命中 t1 ──600ms── 断言 t2
+    ///        └───────── ttl = 1000ms ─────────┘
+    /// 正确实现：t0+1000ms 过期，因此 t2(≈t0+1100ms) 必然是 None
+    /// 错误实现：续期到 t1+1000ms = t0+1500ms，t2 仍是 Some(10)，用例失败
+    /// ```
+    ///
+    /// 两个 `sleep` 都只给出**下界**（`sleep` 只会多睡不会少睡），所以 t2 一定晚于
+    /// `t0 + ttl`；而命中点给了 500ms 的抖动余量，即使 CI 机器卡顿也不会越过 TTL。
+    /// 早先这里用的是 120ms TTL + 4 次 20ms 的命中，macOS runner 上一次调度抖动
+    /// 就直接把条目睡过期了 —— 那是用例自身的脆，不是缓存的 bug。
     #[test]
     fn reads_do_not_extend_the_ttl() {
-        let cache: TtlCache<u32, u32> = cache(Duration::from_millis(120), 4);
+        const TTL: Duration = Duration::from_millis(1000);
+        let cache: TtlCache<u32, u32> = cache(TTL, 4);
         cache.insert(1, 10);
 
-        // TTL 内持续命中（sleep 只会多睡，不会少睡，因此累计时长只多不少）。
-        for _ in 0..4 {
-            std::thread::sleep(Duration::from_millis(20));
-            assert_eq!(cache.get(&1), Some(10));
-        }
-        // 已经过去 ≥80ms，再睡 60ms 就越过了原始 120ms 的 TTL。
-        std::thread::sleep(Duration::from_millis(60));
+        // 命中发生在 TTL 的后半段：离截止时刻越近，「命中续期」的痕迹越明显。
+        std::thread::sleep(TTL / 2);
+        assert_eq!(cache.get(&1), Some(10), "TTL 内必须命中");
+
+        // 越过「写入时刻 + ttl」：没有续期的话，此刻已经过期。
+        std::thread::sleep(TTL / 2 + Duration::from_millis(100));
         assert_eq!(cache.get(&1), None, "读取不得延长 TTL");
         assert_eq!(cache.len(), 0);
     }

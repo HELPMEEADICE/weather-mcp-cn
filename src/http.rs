@@ -40,11 +40,17 @@
 //!   的时刻可能比锚定晚一个连接建立的往返。
 //!
 //! 所以本层保证的是「**派发锚点**之间的间隔不小于 `min_request_interval`」，
-//! 而不是「socket 写出的绝对时刻」。两条实际含义：
+//! 而不是「socket 写出的绝对时刻」。拆开成三条可以逐条验证的结论：
 //!
-//! * 同主机连续请求的锚点间隔（因此也是服务端观测到的到达间隔）不会小于最小间隔；
-//! * 冷连接或极端 OS 抢占下，真实到达可能比上一个请求的锚点再晚一点 —— 只会
-//!   **更分散**，不会更密集。
+//! * 同主机连续请求的**锚点间隔**一定不小于 `min_request_interval`（`sleep` 只会多睡，
+//!   不会早醒）；
+//! * 单个请求的**到达时刻**不会早于它自己的锚点，因此 N 次派发的真实总跨度也不小于
+//!   `(N-1) × min_request_interval` —— 延迟只会让跨度更大，这条与机器快慢无关；
+//! * 但**相邻两次到达的间隔**并不是本层能保证的量：`到达_i = 锚点_i + 该请求自身的
+//!   连接/调度延迟_i`，延迟只加在各自请求身上、不会互相抵消。前一个请求连接更慢时，
+//!   成对间隔会被压缩成 `min_request_interval - (延迟_前 - 延迟_后)`（单核或连接池冷
+//!   启动时实测能压到 60% 左右）。旧实现那种「许可集中放行、请求挤在同一瞬间打出去」
+//!   的失效（实测间隔 2.6 µs）不会发生：那会让总跨度直接塌成 0。
 //!
 //! 本项目不做任何访问控制规避：不换代理池、不伪造验证码、不并发轰炸单一站点。
 
@@ -861,6 +867,12 @@ mod tests {
     /// 服务端收到请求头的时刻减去客户端记录的锚点，就是锚点相对真实发送的全部偏差。
     /// `anchor()` 与 `send()` 之间没有 `.await`，所以这段偏差只剩 OS 抢占与连接建立，
     /// 在本地回环上应当是个位数的毫秒。
+    ///
+    /// 这里的上界**故意放得很松**：它衡量的是机器，不是代码 —— CI runner 一卡顿这个
+    /// 数字就变大。它只用来拦住「把 `anchor()` 挪到某个 `.await` 之前」这类结构性回归
+    /// （那样偏差会等于整个等待时长）。精确的次序不变量由
+    /// `anchor_waits_for_the_concurrency_permit` 用**下界**断言，那一条与
+    /// 机器快慢无关：卡顿只会让间隔更大。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn anchor_time_matches_the_real_request_arrival() {
         let (url, arrivals) = arrival_server(vec!["200 OK"]).await;
@@ -883,16 +895,94 @@ mod tests {
         assert!(arrival >= anchors[0], "锚定时刻必须早于真实到达");
         let skew = arrival.duration_since(anchors[0]);
         assert!(
-            skew <= Duration::from_millis(100),
-            "锚点与真实发送时刻的偏差过大：{skew:?}"
+            skew <= Duration::from_millis(500),
+            "锚点与真实发送时刻的偏差过大（疑似 anchor() 被挪到了 await 之前）：{skew:?}"
         );
     }
 
-    /// 同主机连续请求：锚点间隔与服务端观测到的到达间隔都必须满足最小间隔。
+    /// 锚点只能在**拿到全局并发许可之后**记录。
+    ///
+    /// 用「下界」而不是时间上界来表达这条不变量：第一个请求长期占住唯一的许可
+    /// （服务端扣住回应），第二个请求只能排队；因此它的锚点一定晚于
+    /// 「第一个锚点 + 服务端扣留时长」。谁把 `anchor()` 挪到 `semaphore.acquire()`
+    /// 之前，这个下界立刻被打破 —— 而且卡顿只会让间隔更大，永远不会让用例误报。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn anchor_waits_for_the_concurrency_permit() {
+        const HOLD: Duration = Duration::from_millis(400);
+        let (url, release) = gated_server().await;
+        let config = Config {
+            max_concurrency: 1,
+            max_retries: 0,
+            min_request_interval: Duration::ZERO,
+            request_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let client = std::sync::Arc::new(HttpClient::new(&config).expect("构建客户端"));
+
+        // 第一个请求拿到唯一的许可，然后被服务端扣住。
+        let first = {
+            let client = std::sync::Arc::clone(&client);
+            let url = url.clone();
+            tokio::spawn(async move { client.get_text(&url, None).await })
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while client.anchors().is_empty() {
+            assert!(Instant::now() < deadline, "第一个请求迟迟没有锚定");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // 第二个请求只能卡在许可队列里。
+        let second = {
+            let client = std::sync::Arc::clone(&client);
+            let url = url.clone();
+            tokio::spawn(async move { client.get_text(&url, None).await })
+        };
+        tokio::time::sleep(HOLD).await;
+        assert_eq!(
+            client.anchors().len(),
+            1,
+            "等并发许可期间不允许锚定时刻：{:?}",
+            client.anchors()
+        );
+
+        let _ = release.send(());
+        assert_eq!(
+            first.await.expect("不应 panic").expect("应成功"),
+            "ok",
+            "被扣住的第一个请求在放行后必须成功"
+        );
+        assert_eq!(
+            second.await.expect("不应 panic").expect("应成功"),
+            "ok",
+            "第二个请求在许可释放后必须成功"
+        );
+
+        let anchors = client.anchors();
+        assert_eq!(anchors.len(), 2);
+        let gap = anchors[1] - anchors[0];
+        assert!(
+            gap + Duration::from_millis(2) >= HOLD,
+            "第二个锚点必须晚于许可释放，实际只隔了 {gap:?}"
+        );
+    }
+
+    /// 同主机连续请求：锚点间隔必须满足最小间隔，真实到达也真的被推开了。
+    ///
+    /// # 为什么真实到达用「总跨度」而不是「成对间隔」
+    ///
+    /// `arrival_i = anchor_i + 该请求自己的连接/调度延迟_i`。延迟只加在各自请求身上，
+    /// 不互相抵消，所以**相邻两次到达的间隔**可能被「前一个请求连接更慢」压缩成
+    /// `min_interval - (延迟_前 - 延迟_后)` —— 在单核、连接池冷启动这两种情况下实测
+    /// 都能压到 60% 左右。成对间隔不是本层能保证的量。
+    ///
+    /// 能保证的是下界口径：`最后一次到达 − 第一次锚点 ≥ (N-1) × min_interval`。
+    /// 延迟只会让这个跨度**更大**，因此断言与机器快慢无关，同时仍然能抓住旧实现那种
+    /// 「许可集中释放、请求挤在同一瞬间打出去」的失效（那时跨度≈0）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn consecutive_anchors_obey_the_min_interval() {
-        const MIN_INTERVAL: Duration = Duration::from_millis(60);
-        let (url, arrivals) = arrival_server(vec!["200 OK", "200 OK", "200 OK"]).await;
+        const MIN_INTERVAL: Duration = Duration::from_millis(200);
+        const REQUESTS: usize = 3;
+        let (url, arrivals) = arrival_server(vec!["200 OK"; REQUESTS]).await;
         let config = Config {
             max_retries: 0,
             min_request_interval: MIN_INTERVAL,
@@ -900,12 +990,12 @@ mod tests {
         };
         let client = HttpClient::new(&config).expect("构建客户端");
 
-        for _ in 0..3 {
+        for _ in 0..REQUESTS {
             client.get_text(&url, None).await.expect("应成功");
         }
 
         let anchors = client.anchors();
-        assert_eq!(anchors.len(), 3);
+        assert_eq!(anchors.len(), REQUESTS);
         for pair in anchors.windows(2) {
             let gap = pair[1] - pair[0];
             assert!(
@@ -915,15 +1005,17 @@ mod tests {
         }
 
         let arrivals = lock(&arrivals).clone();
-        assert_eq!(arrivals.len(), 3);
-        for pair in arrivals.windows(2) {
-            let gap = pair[1] - pair[0];
-            // 容差只覆盖回环与计时器精度，不放宽到「接近 0」的量级。
-            assert!(
-                gap + Duration::from_millis(20) >= MIN_INTERVAL,
-                "服务端观测到的到达间隔必须满足最小间隔，实际 {gap:?}"
-            );
-        }
+        assert_eq!(arrivals.len(), REQUESTS);
+        assert!(
+            arrivals[0] >= anchors[0],
+            "服务端不可能在客户端锚定之前就收到请求"
+        );
+        let span = arrivals[REQUESTS - 1] - anchors[0];
+        let expected = MIN_INTERVAL * (REQUESTS as u32 - 1);
+        assert!(
+            span + Duration::from_millis(2) >= expected,
+            "真实发送的总跨度必须覆盖 {expected:?}，实际只有 {span:?}"
+        );
     }
 
     /// 重试也必须重新排队等限速，不能沿用上一次的锚点直接重发。
@@ -955,17 +1047,29 @@ mod tests {
 
         let arrivals = lock(&arrivals).clone();
         assert_eq!(arrivals.len(), 2);
-        let wire_gap = arrivals[1] - arrivals[0];
         assert!(
-            wire_gap + Duration::from_millis(20) >= MIN_INTERVAL,
-            "重试的真实到达间隔也要满足最小间隔，实际 {wire_gap:?}"
+            arrivals[0] >= anchors[0],
+            "服务端不可能在客户端锚定之前就收到请求"
+        );
+        // 同样用下界口径：`最后一次到达 − 第一次锚点 ≥ 一个完整的最小间隔`。
+        // 成对到达间隔会被「第一次请求连接更慢」压缩，不能拿来做断言。
+        let span = arrivals[1] - anchors[0];
+        assert!(
+            span + Duration::from_millis(2) >= MIN_INTERVAL,
+            "重试的真实发送必须晚于第一个锚点一个最小间隔，实际 {span:?}"
         );
     }
 
     /// 排队中被取消的请求不能把主机闸门卡死，也不能留下过期状态。
+    ///
+    /// 取消必须发生在限速等待**期间**，所以「超时时长」和「最小间隔」之间要留足倍数：
+    /// 早先这里是 10ms / 150ms，只要 CI runner 把运行线程饿住 140ms，第二个请求就会
+    /// 先睡完间隔、真的发出去，用例便会误报。现在取 100ms / 600ms，留出 500ms 的
+    /// 调度抖动余量；断言本身没有放松（仍然要求闸门可用且限速状态不丢）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelling_a_throttled_request_does_not_wedge_the_host_gate() {
-        const MIN_INTERVAL: Duration = Duration::from_millis(150);
+        const MIN_INTERVAL: Duration = Duration::from_millis(600);
+        const CANCEL_AFTER: Duration = Duration::from_millis(100);
         let (url, _arrivals) = arrival_server(vec!["200 OK", "200 OK"]).await;
         let config = Config {
             max_retries: 0,
@@ -976,9 +1080,8 @@ mod tests {
 
         client.get_text(&url, None).await.expect("第一次应成功");
 
-        // 第二次请求会在主机闸门的 sleep 里被取消（10ms < 150ms）。
-        let cancelled =
-            tokio::time::timeout(Duration::from_millis(10), client.get_text(&url, None)).await;
+        // 第二次请求会在主机闸门的 sleep 里被取消（100ms ≪ 600ms）。
+        let cancelled = tokio::time::timeout(CANCEL_AFTER, client.get_text(&url, None)).await;
         assert!(cancelled.is_err(), "第二次请求应在限速等待中被取消");
 
         // 第三次请求必须能正常完成 —— 闸门既没卡死，也没丢掉限速状态。

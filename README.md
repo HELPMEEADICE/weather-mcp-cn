@@ -686,7 +686,17 @@ coverage_end     = 最后一段 segment 的结束时刻（不会超过 deadline�
 | 操作系统线程抢占（`anchor()` 之后的任意指令处） | 微秒级，极端负载下可能到毫秒级 | 真实发送比锚点晚 |
 | 连接建立（DNS / TCP / TLS 在 `send()` 的后续 poll 里） | 本地回环个位数毫秒，冷连接可到几十毫秒 | 真实发送比锚点晚 |
 
-两者都只会让真实到达**更分散**，不会更密集。所以准确的表述是「**派发锚点**之间的间隔不小于 `min_request_interval`」，而不是「socket 写出的绝对时刻被精确控制」。`anchor_time_matches_the_real_request_arrival` 断言「服务端到达时刻 − 客户端锚点」在本地回环上 ≤ 100 ms；`consecutive_anchors_obey_the_min_interval` 与 `retries_re_enter_the_host_gate` 分别覆盖顺序请求与重试；`cancelling_a_throttled_request_does_not_wedge_the_host_gate` 与 `cancelling_while_waiting_for_a_permit_does_not_leak_it` 覆盖取消安全（不卡死主机闸门、不吞并发许可）。锚点记录是 `#[cfg(test)]` 字段，生产构建里根本不存在。
+两者都只会让真实到达比**它自己的**锚点更晚。由此得到三条可以逐条验证的结论：
+
+| 结论 | 是否硬保证 | 验证用例 |
+| --- | --- | --- |
+| 同主机连续请求的**锚点间隔** ≥ `min_request_interval` | ✅（`sleep` 不会早醒） | `consecutive_anchors_obey_the_min_interval` / `retries_re_enter_the_host_gate` |
+| N 次派发的**真实总跨度** ≥ `(N-1) × min_request_interval` | ✅（延迟只会让跨度更大） | 同上（下界口径） |
+| **相邻两次到达的间隔** ≥ `min_request_interval` | ❌ 不是本层能保证的量 | — |
+
+第三条要特别说明：`到达_i = 锚点_i + 该请求自身的连接/调度延迟_i`，延迟只加在各自请求身上、**不会互相抵消**。前一个请求连接更慢时，成对间隔会被压缩成 `min_request_interval − (延迟_前 − 延迟_后)`（单核或连接池冷启动时实测能压到 60% 左右）。这不是缺陷，是 HTTP 客户端抽象层之上不可观测的部分——所以相关断言一律用「总跨度」这种下界口径，而不是成对间隔。旧实现那种「许可集中放行、请求挤在同一瞬间打出去」的失效（实测间隔 2.6 µs）会让总跨度直接塌成 0，仍然能被抓住。
+
+所以准确的表述是「**派发锚点**之间的间隔不小于 `min_request_interval`」，而不是「socket 写出的绝对时刻被精确控制」。`anchor_time_matches_the_real_request_arrival` 只用 500 ms 的粗上界拦住「把锚点挪到某个 `.await` 之前」这类结构性回归（该数字衡量的是机器，会随 CI 负载浮动，因此不收紧）；精确的次序不变量由 `anchor_waits_for_the_concurrency_permit` 用下界断言（等许可期间不允许锚定）；`cancelling_a_throttled_request_does_not_wedge_the_host_gate` 与 `cancelling_while_waiting_for_a_permit_does_not_leak_it` 覆盖取消安全（不卡死主机闸门、不吞并发许可）。锚点记录是 `#[cfg(test)]` 字段，生产构建里根本不存在。
 
 ---
 
@@ -765,7 +775,7 @@ cargo clippy --all-targets --locked --no-default-features --features tls-native-
 
 | 目标 | 数量 | 内容 |
 | --- | --- | --- |
-| `src/lib.rs` 单元测试 | 100 | LRU/TTL 淘汰（含链表不变量校验、TTL 不续期与中毒恢复）与 singleflight、窗口语义（跨日/月/年/闰日/时区/1-3-12-24 小时、缺口、重叠、截止时刻边界）、限速器主机隔离与**锚点/取消安全**、预警异常结构、HTTP 体积上限、解析器、城市后缀、MCP 工具层真实页面窗口 |
+| `src/lib.rs` 单元测试 | 101 | LRU/TTL 淘汰（含链表不变量校验、TTL 不续期与中毒恢复）与 singleflight、窗口语义（跨日/月/年/闰日/时区/1-3-12-24 小时、缺口、重叠、截止时刻边界）、限速器主机隔离与**锚点/取消安全**、预警异常结构、HTTP 体积上限、解析器、城市后缀、MCP 工具层真实页面窗口 |
 | `tests/parser_tests.rs` | 25 | **真实抓取样本**离线验证四个解析器，含空预警/`w:null`/损坏 JSON、67 KB 完整页面，以及 `1d`/`23d`/`7d` 的合并、冲突、缺失、乱序、跨月/跨年、时点数上限 |
 | `tests/city_tests.rs` | 12 | 内置 3221 条城市库的名称/代码/层级/歧义解析 |
 | `tests/provider_cache_tests.rs` | 6 | **真实缓存实现** + 回放样本：交叉查询上下文隔离、命中不打上游、并发 singleflight、失败不缓存 |
@@ -775,7 +785,7 @@ cargo clippy --all-targets --locked --no-default-features --features tls-native-
 | `tests/mcp_tests.rs` | 7 | **真正启动二进制**走 stdio：`initialize` → `tools/list` → `tools/call` → 工具错误语义 → 出错后继续服务 |
 | `tests/live_tests.rs` | 14 | 联网集成测试（含 403/CDN 拦截回归），默认 `#[ignore]` |
 
-`cargo test` 汇总：**168 passed, 0 failed, 14 ignored**（三套 TLS feature 组合同样全绿）。
+`cargo test` 汇总：**169 passed, 0 failed, 14 ignored**（三套 TLS feature 组合同样全绿）。
 
 关键回归用例：
 
@@ -791,8 +801,9 @@ cargo clippy --all-targets --locked --no-default-features --features tls-native-
 | `gap_between_buckets_is_not_counted_as_coverage` / `contiguous_hours_stop_at_the_first_gap` | 缺口不计入累计覆盖；连续覆盖在第一个缺口处停止 |
 | `bucket_exactly_at_the_deadline_covers_nothing` | 时点恰好等于截止时刻时返回结构化工具错误 |
 | `same_host_sends_keep_the_min_interval_when_permits_are_released_together` | 许可集中释放后同主机真实发送间隔仍 ≥ 配置值（旧实现实测 2.6 µs） |
-| `anchor_time_matches_the_real_request_arrival` | 客户端锚点与服务端真实到达时刻的偏差在本地回环上 ≤ 100 ms |
-| `consecutive_anchors_obey_the_min_interval` / `retries_re_enter_the_host_gate` | 顺序请求与重试都重新排队等限速（锚点与真实到达两条口径同时断言） |
+| `anchor_time_matches_the_real_request_arrival` | 粗上界（500 ms）：拦住「把 `anchor()` 挪到 `.await` 之前」这类结构性回归；该数字随机器负载浮动，不收紧 |
+| `anchor_waits_for_the_concurrency_permit` | 等全局并发许可期间**不允许**锚定时刻（下界断言，与机器快慢无关） |
+| `consecutive_anchors_obey_the_min_interval` / `retries_re_enter_the_host_gate` | 顺序请求与重试都重新排队等限速：锚点间隔 + 真实到达**总跨度**两条口径同时断言 |
 | `cancelling_a_throttled_request_does_not_wedge_the_host_gate` / `cancelling_while_waiting_for_a_permit_does_not_leak_it` | 取消不卡死主机闸门，也不吞掉全局并发许可 |
 | `declared_oversized_content_length_is_rejected_before_reading` | 声明 `Content-Length` 超过 4 MiB 的 2xx 响应在读之前就失败 |
 | `reads_do_not_extend_the_ttl` | 命中只改变 LRU 顺序，不延长 TTL |
